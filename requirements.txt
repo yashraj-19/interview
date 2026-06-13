@@ -1,0 +1,17 @@
+# SViam voice interviewer — dependencies
+# Install:  venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# Pipecat extras:
+#   deepgram = STT (nova-3) + TTS (Aura-2)
+#   groq, google = conversation / judge LLM providers (swappable via .env)
+#   silero = VAD (turn-taking, barge-in)
+#   webrtc = SmallWebRTCTransport (browser, full-duplex) + aiortc/av
+#   local  = PyAudio (deprecated local-mic path; still imported by smooth_audio.py)
+pipecat-ai[deepgram,google,groq,silero,webrtc,local]
+
+python-dotenv
+fastapi
+uvicorn[standard]
+
+# Optional: swap the judge/conversation LLM to Claude (set JUDGE_PROVIDER=anthropic)
+# anthropic
