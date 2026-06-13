@@ -269,7 +269,9 @@ async def run_bot(connection: SmallWebRTCConnection):
     # Layering: smart ML (fast) -> smart 3s silence -> watchdog 5s -> phantom guard.
     # Both strategies run in parallel (first to fire ends the turn); reset() cancels the
     # loser and the de-dup guard prevents a double reply.
-    barge = BargeInManager(state)
+    # on_bot_idle: when the playback-heartbeat reconciler detects the bot actually stopped
+    # (transport skipped BotStoppedSpeaking), also clear the start strategy's private flag.
+    barge = BargeInManager(state, on_bot_idle=start_strat.resync)
 
     def _full_resync():
         """Clear EVERY 'bot speaking' tracker (shared state + barge manager + start

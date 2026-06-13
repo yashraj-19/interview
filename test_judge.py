@@ -9,7 +9,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from judge import JUDGE_MODEL, JUDGE_PROVIDER, judge_answer  # noqa: E402
+from judge import (  # noqa: E402
+    JUDGE_MODEL,
+    JUDGE_PROVIDER,
+    _reads_as_clarification,
+    judge_answer,
+)
 
 CASES = [
     # (question, answer, expectation)
@@ -53,6 +58,12 @@ CASES = [
         "I'd do the take loop and then the uh map thing for the the values.",
         "EXPECT CONTINUE (garbled / unclear — must NOT interrupt to clarify)",
     ),
+    (
+        "Tell me about a recent project you worked on.",
+        "I wanted to keep the topper's name on top, so I used a stack and an array.",
+        "EXPECT DEFER (a 'clarify how the stack helped' follow-up is the interviewer's job "
+        "at turn-end, NOT a judge interrupt — downgraded by the discipline guard)",
+    ),
 ]
 
 
@@ -73,6 +84,27 @@ async def main():
         print(f"\nattempt {attempt}: {'INTERRUPT' if v['interrupt'] else 'continue'}")
         if v["interrupt"]:
             print(f"   line: {v['line']}")
+
+    print("\n" + "=" * 70 + "\nDOWNGRADE GUARD (deterministic — clarification/follow-up -> defer):")
+    samples = [
+        # (interjection, expect_downgrade)  True => downgrade interrupt -> defer
+        ("That's an interesting goal, but can you clarify how using a stack helped you achieve that?", True),
+        ("Can you walk me through how you used the stack in your solution?", True),
+        ("Tell me more about the data structure you chose for this.", True),
+        # Regression: "I'm not sure I follow" is a clarification, NOT a correction (bare "sure"
+        # used to block this downgrade — caught live as a wrongly-hard interrupt).
+        ("I'm not sure I follow, can you explain how your linked list would handle a much larger number of registrants?", True),
+        ("Actually, a stack is LIFO, not FIFO. Can you reconsider?", False),
+        ("Are you sure that's O(n)? Think about how hashing works.", False),
+        ("Hash map lookups are typically much faster. Can you reconsider your approach?", False),
+    ]
+    all_ok = True
+    for line, expect in samples:
+        got = _reads_as_clarification(line)
+        ok = got == expect
+        all_ok = all_ok and ok
+        print(f"  [{'OK ' if ok else 'FAIL'}] downgrade={got} (expect {expect}): {line}")
+    print("  => DOWNGRADE GUARD: " + ("ALL PASS" if all_ok else "SOME FAIL"))
 
 
 if __name__ == "__main__":

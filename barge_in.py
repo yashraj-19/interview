@@ -27,6 +27,7 @@ import time
 from loguru import logger
 
 from pipecat.frames.frames import (
+    BotSpeakingFrame,
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     Frame,
@@ -167,7 +168,15 @@ class BargeInManager(FrameProcessor):
       starting, the bot yields (user wins ties).
     """
 
-    def __init__(self, state, tie_window_s: float = 0.3, stitch_window_s: float = 1.5, **kwargs):
+    def __init__(
+        self,
+        state,
+        tie_window_s: float = 0.3,
+        stitch_window_s: float = 1.5,
+        on_bot_idle=None,
+        bot_idle_secs: float = 1.5,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self._state = state
         self._tie_window_s = tie_window_s
@@ -182,6 +191,16 @@ class BargeInManager(FrameProcessor):
         self._awaiting_cut = False
         self._bot_pending = False    # turn ended, LLM running, bot not speaking yet
         self._stitch_locked = False  # stitch at most once per cycle (until bot speaks)
+        # Bot-playback heartbeat reconciler (SOURCE fix for the BotStoppedSpeaking desync).
+        # The output transport emits BotSpeakingFrame every 0.2s ONLY while audio actually
+        # plays. If state.bot_speaking is True but that heartbeat has stopped for bot_idle_secs,
+        # the transport's BotStoppedSpeaking was skipped (it races on _tts_audio_received when
+        # an extra mid-turn utterance — e.g. a judge correction — overlaps the reply). We then
+        # flip bot_speaking back to False at the source, so the watchdog never has to.
+        self._on_bot_idle = on_bot_idle
+        self._bot_idle_secs = bot_idle_secs
+        self._t_last_bot_heartbeat = 0.0
+        self._reconciler: asyncio.Task | None = None
 
     def resync(self):
         """Recover from a TTS connection drop (e.g. Deepgram 1011). The bot's audio died
@@ -198,6 +217,16 @@ class BargeInManager(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+
+        # Lazily start the bot-playback reconciler once we're inside the running loop.
+        if self._reconciler is None:
+            self._reconciler = asyncio.create_task(self._reconcile_loop())
+
+        if isinstance(frame, BotSpeakingFrame):
+            # Playback heartbeat (~every 0.2s while the bot's audio actually plays).
+            self._t_last_bot_heartbeat = time.monotonic()
+            await self.push_frame(frame, direction)
+            return
 
         if isinstance(frame, VADUserStartedSpeakingFrame):
             self._t_vad = time.monotonic()
@@ -239,6 +268,7 @@ class BargeInManager(FrameProcessor):
             self._state.bot_speaking = True
             self._state.bot_pending = False
             self._state.t_bot_speaking = time.monotonic()
+            self._t_last_bot_heartbeat = time.monotonic()
             if self._t_user_stopped:
                 latency = (time.monotonic() - self._t_user_stopped) * 1000
                 trigger = self._state.last_turn_trigger or "?"
@@ -311,6 +341,38 @@ class BargeInManager(FrameProcessor):
 
         self._generated.clear()
         self._spoken.clear()
+
+    async def _reconcile_loop(self):
+        """SOURCE fix for the BotStoppedSpeaking desync (root cause, not watchdog-masked).
+        The output transport emits BotSpeakingFrame ~every 0.2s ONLY while audio actually
+        plays; its BotStoppedSpeaking can be SKIPPED (it gates on _tts_audio_received and a
+        single _bot_speaking bool, which an extra mid-turn utterance — e.g. a judge correction
+        — overlapping the reply can race), leaving bot_speaking stuck True. If the playback
+        heartbeat has gone quiet for bot_idle_secs while bot_speaking is still True, the bot
+        has actually stopped -> flip it False here so the 15s phantom watchdog never has to."""
+        try:
+            while True:
+                await asyncio.sleep(0.3)
+                if not self._state.bot_speaking:
+                    continue
+                idle = time.monotonic() - self._t_last_bot_heartbeat
+                if idle <= self._bot_idle_secs:
+                    continue
+                logger.info(
+                    f"BOT_SPEAKING reconciled -> False (playback heartbeat quiet {idle:.1f}s; "
+                    "transport skipped BotStoppedSpeaking)"
+                )
+                self._state.bot_speaking = False
+                self._awaiting_cut = False
+                if self._on_bot_idle:
+                    self._on_bot_idle()  # clear the start-strategy's private bot-speaking flag too
+        except asyncio.CancelledError:
+            return
+
+    async def cleanup(self):
+        if self._reconciler and not self._reconciler.done():
+            self._reconciler.cancel()
+        await super().cleanup()
 
 
 class EmergencyTurnEnd(BaseUserTurnStopStrategy):

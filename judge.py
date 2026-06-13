@@ -122,15 +122,47 @@ async def _call_anthropic(system: str, user: str) -> str:
 
 
 def _parse(raw: str) -> dict:
-    """Extract {'interrupt': bool, 'line': str}; safe-default to continue."""
+    """Extract {'interrupt': bool, 'line': str, 'defer': bool}; safe-default to continue."""
     try:
         start, end = raw.find("{"), raw.rfind("}")
         if start == -1 or end == -1:
-            return {"interrupt": False, "line": ""}
+            return {"interrupt": False, "line": "", "defer": False}
         obj = json.loads(raw[start : end + 1])
-        return {"interrupt": bool(obj.get("interrupt")), "line": str(obj.get("line") or "").strip()}
+        return {
+            "interrupt": bool(obj.get("interrupt")),
+            "line": str(obj.get("line") or "").strip(),
+            "defer": False,
+        }
     except Exception:
-        return {"interrupt": False, "line": ""}
+        return {"interrupt": False, "line": "", "defer": False}
+
+
+# --- Post-verdict discipline (caveat 2): a clarification/follow-up is the INTERVIEWER's job
+# at turn-end, not a judge interrupt. Only a CLEAR FACTUAL ERROR earns a hard interrupt; an
+# interjection that merely asks the candidate to clarify/elaborate — naming no specific
+# incorrect fact — is downgraded interrupt -> DEFER. ---
+_CLARIFY_MARKERS = (
+    "clarify", "can you explain", "could you explain", "tell me more", "walk me through",
+    "elaborate", "what do you mean", "how did you", "how exactly", "what was", "what made",
+    "describe", "help me understand", "more about", "what specifically", "in what way",
+    "can you tell me more", "go into", "what kind of", "what type of",
+)
+_CORRECTION_MARKERS = (
+    # "are you sure" (the nudge), NOT bare "sure" — "I'm not sure I follow" is a clarification.
+    "are you sure", "actually", "isn't", "aren't", "wasn't", "doesn't", "don't think",
+    "not correct", "incorrect", "not right", "not quite", "not the", "wrong", "mistake",
+    "reconsider", "that's not", "thats not", "confusion", "i think there", "double-check",
+    "double check", "rethink", "not a ", "not an ", "really o", "should be",
+)
+
+
+def _reads_as_clarification(line: str) -> bool:
+    """True if the interjection is a clarification/follow-up request that names no specific
+    incorrect fact — the interviewer's job at turn-end (DEFER), not a judge interrupt."""
+    t = line.lower()
+    asks_clarification = any(m in t for m in _CLARIFY_MARKERS)
+    names_error = any(m in t for m in _CORRECTION_MARKERS)
+    return asks_clarification and not names_error
 
 
 async def judge_answer(question: str, answer: str, attempt: int = 1) -> dict:
@@ -152,5 +184,14 @@ async def judge_answer(question: str, answer: str, attempt: int = 1) -> dict:
             raw = await _call_groq(system, user)
     except Exception as e:
         logger.error(f"judge LLM call failed: {e}")
-        return {"interrupt": False, "line": ""}
-    return _parse(raw)
+        return {"interrupt": False, "line": "", "defer": False}
+    verdict = _parse(raw)
+    # Discipline downgrade: a clarification/follow-up interjection (no incorrect fact named)
+    # is the interviewer's job -> DEFER, not a hard interrupt.
+    if verdict["interrupt"] and _reads_as_clarification(verdict["line"]):
+        logger.info(
+            f"JUDGE_DOWNGRADED interrupt->defer (clarification, no fact named): {verdict['line']}"
+        )
+        verdict["interrupt"] = False
+        verdict["defer"] = True
+    return verdict
