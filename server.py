@@ -323,7 +323,7 @@ async def run_bot(connection: SmallWebRTCConnection):
             TranscriptLogger(),       # CANDIDATE> logging
             EventBridge(role="in"),   # candidate transcript + status -> UI
             DynamicsTracker(state),   # ask-back detection
-            # InterruptJudge(state),  # STEP 3 — re-enabled & tuned later (judge stays OFF)
+            InterruptJudge(state),    # STEP 3: wrong-answer correction — cuts in via TTS on a clear error
             SilenceMonitor(),         # silence auto-prompt
             aggregator.user(),
             llm,
