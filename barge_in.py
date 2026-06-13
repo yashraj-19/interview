@@ -338,6 +338,7 @@ class EmergencyTurnEnd(BaseUserTurnStopStrategy):
         watchdog_secs: float = 4.0,
         pending_max: float = 6.0,
         speaking_max: float = 15.0,
+        on_resync=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -350,6 +351,12 @@ class EmergencyTurnEnd(BaseUserTurnStopStrategy):
         # then clears the flag and forces the turn, so it can never wait on it forever.
         self._pending_max = pending_max
         self._speaking_max = speaking_max
+        # on_resync: a full resync of EVERY 'bot speaking' tracker (start strategy etc.), not
+        # just state.bot_speaking. On a laggy link BotStoppedSpeaking can be lost, leaving the
+        # start strategy's private copy stuck True -> it then refuses to start normal turns and
+        # the watchdog's forced turn-end produces NO reply (seen live). Calling this on every
+        # watchdog intervention keeps all trackers in sync.
+        self._on_resync = on_resync
         self._has_transcript = False
         self._t_last_transcript = 0.0
         self._monitor: asyncio.Task | None = None
@@ -373,6 +380,12 @@ class EmergencyTurnEnd(BaseUserTurnStopStrategy):
         self._monitor = asyncio.create_task(self._monitor_turn())
 
     async def _end_turn(self, trigger: str, message: str):
+        # Full resync FIRST: clear any stuck 'bot speaking' state across ALL trackers so the
+        # forced turn-end actually produces a reply (a phantom start-strategy flag otherwise
+        # blocks the turn from starting). Safe here — _end_turn only runs on watchdog/backstop
+        # paths, where the bot is not legitimately speaking.
+        if self._on_resync:
+            self._on_resync()
         self._state.last_turn_trigger = trigger
         self._has_transcript = False
         logger.warning(message)
@@ -386,9 +399,9 @@ class EmergencyTurnEnd(BaseUserTurnStopStrategy):
                 return
             if not (self._state.bot_speaking or self._state.bot_pending):
                 await self._end_turn(
-                    "force",
-                    f"FORCE_TURN_END: finalized transcript + {self._silence_secs}s silence "
-                    "— forcing turn end",
+                    "watchdog",
+                    f"WATCHDOG backstop: no turn-end {self._silence_secs}s after last "
+                    "transcript (smart-turn never fired) — forcing turn end",
                 )
                 return
             # Phase 2 — bot looked busy; keep watching until it's genuinely idle, OR until a

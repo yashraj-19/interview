@@ -20,6 +20,7 @@ live + VAD turn strategy", not a parameter.
 import asyncio
 import os
 import sys
+import time
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -141,26 +142,67 @@ class EventBridge(FrameProcessor):
 
 
 class LoggingSmartTurn(LocalSmartTurnAnalyzerV3):
-    """Logs each smart-turn decision and tags how the turn ended (smart prediction
-    vs stop_secs silence fallback) on ConversationState for the per-turn summary."""
+    """Logs each smart-turn decision and tags how the turn ended (smart ML prediction
+    vs stop_secs silence fallback) on ConversationState for the per-turn summary.
+
+    _fallback_pending keeps the label honest: when append_audio reports COMPLETE on the
+    silence backstop, _handle_input_audio immediately also calls analyze_end_of_turn — we
+    must not let that overwrite "fallback" with "smart"."""
 
     def __init__(self, state, **kwargs):
         super().__init__(**kwargs)
         self._state = state
+        self._fallback_pending = False
 
     def append_audio(self, buffer, is_speech):
         st = super().append_audio(buffer, is_speech)
         if st == EndOfTurnState.COMPLETE:
             self._state.last_turn_trigger = "fallback"
+            self._fallback_pending = True
             logger.info("SMART_TURN append_audio -> COMPLETE (stop_secs silence fallback)")
         return st
 
     async def analyze_end_of_turn(self):
         st, metrics = await super().analyze_end_of_turn()
-        if st == EndOfTurnState.COMPLETE:
+        if st == EndOfTurnState.COMPLETE and not self._fallback_pending:
             self._state.last_turn_trigger = "smart"
+        self._fallback_pending = False
         logger.info(f"SMART_TURN analyze -> {st.name}")
         return st, metrics
+
+
+class GuardedSmartTurnStop(TurnAnalyzerUserTurnStopStrategy):
+    """Smart-turn stop strategy + double-reply DE-DUP guard.
+
+    A delayed/duplicate finalized transcript can fire a turn-end AFTER the bot has already
+    started replying (seen live: two questions back-to-back). If a reply is already speaking
+    or in flight (bot_speaking/bot_pending), suppress the turn-end so no second reply starts.
+    Safe in step 2 because user-interrupts-bot is OFF (no legitimate new turn during bot
+    speech) — revisit when full-duplex barge-in lands in step 4."""
+
+    def __init__(self, state, *, turn_analyzer, **kwargs):
+        super().__init__(turn_analyzer=turn_analyzer, **kwargs)
+        self._state = state
+
+    async def trigger_user_turn_stopped(self):
+        # De-dup, but ONLY for a genuinely fresh in-flight reply. A bot_pending/bot_speaking
+        # flag stuck True far longer than any real generation (~6s) / spoken reply (~15s) is a
+        # PHANTOM (lost BotStoppedSpeaking on a bad link). Trusting it blindly blocks every
+        # turn-end -> "transcript arrives but she never replies". So clear stale flags and let
+        # the reply through; only a recent flag means a real reply is actually in flight.
+        now = time.monotonic()
+        busy_real = (
+            (self._state.bot_pending and now - self._state.t_bot_pending <= 6.0)
+            or (self._state.bot_speaking and now - self._state.t_bot_speaking <= 15.0)
+        )
+        if busy_real:
+            logger.info("TURN_END suppressed (smart): reply genuinely in-flight — de-dup")
+            return
+        if self._state.bot_pending or self._state.bot_speaking:
+            logger.info("TURN_END: clearing stale phantom bot flag, proceeding with reply")
+            self._state.bot_pending = False
+            self._state.bot_speaking = False
+        await super().trigger_user_turn_stopped()
 
 
 # ---------------------------------------------------------------------------
@@ -176,10 +218,7 @@ async def run_bot(connection: SmallWebRTCConnection):
     state = ConversationState()
 
     # interim_results=True: the barge-in strategy counts words in real time.
-    # utterance_end_ms/vad_events + a longer endpointing keep Deepgram from
-    # FINALIZING on short mid-thought pauses (it previously used aggressive
-    # defaults: endpointing=None~10ms, utterance_end_ms=None). The actual
-    # turn-END decision is owned by the smart-turn analyzer, not Deepgram.
+    # The actual turn-END decision is owned by the smart-turn analyzer, not Deepgram.
     stt = DeepgramSTTService(
         api_key=va.DEEPGRAM_API_KEY,
         live_options=LiveOptions(
@@ -188,13 +227,13 @@ async def run_bot(connection: SmallWebRTCConnection):
             interim_results=True,
             smart_format=True,
             vad_events=True,
-            # Low endpointing -> finalized transcripts arrive fast, so the smart-turn
-            # strategy (which waits for the final after predicting complete) can end the
-            # turn in ~300-500ms instead of being gated by Deepgram. utterance_end_ms is
-            # only a finalization backstop. Turn-END is owned by smart-turn, so fast
-            # finals do NOT cause premature ends on mid-thought pauses.
+            # endpointing=250 (spec §3): finals arrive fast WITHOUT over-fragmenting.
+            # endpointing=100 split utterances into "use" / "order of" / "log n." finals
+            # (observed live). Smart-turn and the watchdog act on ACCUMULATED text across
+            # finals, never on one fragment, so 250 just yields cleaner, larger finals.
+            # utterance_end_ms is only a finalization backstop.
             utterance_end_ms=1000,
-            endpointing=100,
+            endpointing=250,
         ),
     )
     tts = DeepgramTTSService(
@@ -217,19 +256,45 @@ async def run_bot(connection: SmallWebRTCConnection):
     start_strat = HumanBargeInStartStrategy(
         min_words=3, sustained_secs=0.7, enable_interruptions=False
     )
-    # Turn END (STEP 1 reliability): transcript-driven end-of-turn ~2.5s after the last
-    # finalized transcript, plus a 4s WATCHDOG that force-resyncs if a TTS reconnect leaves
-    # the turn state stuck. Smart-turn (semantic pause handling) is re-introduced in step 2.
+    # Turn END (STEP 2): smart-turn-v3 ML analyzer OWNS the normal decision — it waits
+    # through mid-sentence pauses (predicts INCOMPLETE) and ends the turn once you're
+    # actually done (COMPLETE), with a 3.0s silence backstop (> ~2.5s natural pauses, spec
+    # §3). GuardedSmartTurnStop adds the double-reply de-dup guard.
+    #
+    # EmergencyTurnEnd from STEP 1 stays UNDERNEATH as the reliability backstop. Its
+    # transcript-driven timer is raised to 5.0s (> smart-turn's 3.0s) so it NEVER preempts
+    # smart-turn — it only fires if smart-turn never ends the turn (e.g. degraded audio
+    # starves smart-turn's audio-frame silence backstop). Its phantom-flag watchdog
+    # (bot_pending stuck >6s / bot_speaking >15s) still catches lost-reply stuck states.
+    # Layering: smart ML (fast) -> smart 3s silence -> watchdog 5s -> phantom guard.
+    # Both strategies run in parallel (first to fire ends the turn); reset() cancels the
+    # loser and the de-dup guard prevents a double reply.
+    barge = BargeInManager(state)
+
+    def _full_resync():
+        """Clear EVERY 'bot speaking' tracker (shared state + barge manager + start
+        strategy) so a lost BotStoppedSpeaking can't desync the turn machine and swallow
+        the next reply. Invoked by the watchdog on every forced turn-end."""
+        barge.resync()
+        start_strat.resync()
+
+    smart_stop = GuardedSmartTurnStop(
+        state,
+        turn_analyzer=LoggingSmartTurn(state, params=SmartTurnParams(stop_secs=3.0)),
+    )
     turn_strategies = UserTurnStrategies(
         start=[start_strat],
-        stop=[EmergencyTurnEnd(state, silence_secs=2.5, watchdog_secs=4.0)],
+        stop=[
+            smart_stop,
+            EmergencyTurnEnd(
+                state, silence_secs=5.0, watchdog_secs=4.0, on_resync=_full_resync
+            ),
+        ],
     )
     aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(user_turn_strategies=turn_strategies),
     )
-
-    barge = BargeInManager(state)
 
     # STEP 1 reliability resync: a Deepgram TTS websocket drop (e.g. 1011) can die
     # mid-utterance WITHOUT emitting BotStoppedSpeakingFrame, leaving bot_speaking/bot_pending
@@ -258,7 +323,7 @@ async def run_bot(connection: SmallWebRTCConnection):
             TranscriptLogger(),       # CANDIDATE> logging
             EventBridge(role="in"),   # candidate transcript + status -> UI
             DynamicsTracker(state),   # ask-back detection
-            # InterruptJudge(state),  # STEP 2 — disabled for now (was over-interrupting)
+            # InterruptJudge(state),  # STEP 3 — re-enabled & tuned later (judge stays OFF)
             SilenceMonitor(),         # silence auto-prompt
             aggregator.user(),
             llm,
