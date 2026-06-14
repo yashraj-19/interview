@@ -278,6 +278,7 @@ class BargeInManager(FrameProcessor):
         elif isinstance(frame, LLMTextFrame):
             if frame.text:
                 self._generated.append(frame.text)
+                self._state.t_last_bot_text = time.monotonic()  # reply text produced (reply-watchdog gate)
         elif isinstance(frame, BotStartedSpeakingFrame):
             self._bot_pending = False
             self._stitch_locked = False  # bot is speaking -> stitching may re-arm

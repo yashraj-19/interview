@@ -147,6 +147,7 @@ class ConversationState:
         self.bot_pending = False     # a turn ended; the LLM reply is in flight
         self.t_bot_speaking = 0.0    # monotonic time bot_speaking last went True (phantom-flag guard)
         self.t_bot_pending = 0.0     # monotonic time bot_pending last went True (phantom-flag guard)
+        self.t_last_bot_text = 0.0   # monotonic time the bot last produced reply text (LLMTextFrame)
 
 
 ASK_BACK_PHRASES = (

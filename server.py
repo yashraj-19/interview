@@ -38,6 +38,7 @@ from pipecat.frames.frames import (
     LLMRunFrame,
     LLMTextFrame,
     TranscriptionFrame,
+    TTSSpeakFrame,
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
@@ -136,6 +137,12 @@ class EventBridge(FrameProcessor):
                             {"type": "transcript", "role": "bot", "text": self._bot_text.strip()}
                         )
                     self._bot_text = ""
+                elif isinstance(frame, TTSSpeakFrame) and frame.text.strip():
+                    # Silence prompts + judge corrections speak via TTSSpeakFrame (not the LLM
+                    # text path), so forward their text to the UI the same way LLM replies are.
+                    await ui_broadcast(
+                        {"type": "transcript", "role": "bot", "text": frame.text.strip()}
+                    )
         except Exception as e:
             logger.debug(f"EventBridge error: {e}")
         await self.push_frame(frame, direction)
@@ -352,23 +359,57 @@ async def run_bot(connection: SmallWebRTCConnection):
     )
     runner = WorkerRunner(handle_sigint=False)  # background task under uvicorn — no signal handling
 
+    greeted = {"done": False}
+
     @transport.event_handler("on_client_connected")
     async def _on_connected(_transport, _client):
         logger.info("client connected — greeting")
         await ui_broadcast({"type": "status", "status": "listening"})
-        await task.queue_frames([LLMRunFrame()])  # bot greets first
+        # Idempotent: greet exactly once per pipeline, even if on_client_connected re-fires
+        # (renegotiation / flaky reconnect on the same pipeline must not double-greet).
+        if not greeted["done"]:
+            greeted["done"] = True
+            await task.queue_frames([LLMRunFrame()])  # bot greets first
 
     @transport.event_handler("on_client_disconnected")
     async def _on_disconnected(_transport, _client):
         logger.info("client disconnected — ending pipeline")
         await runner.cancel()
 
+    async def _reply_watchdog():
+        # Demo-critical safety: if a user turn ended (bot_pending) but no reply lands within
+        # reply_secs — e.g. a startup reconnect ate the first turn, or an interrupt left the
+        # turn-stop without a reply — FORCE one via LLMRunFrame instead of sitting silent until
+        # the 30s silence prompt. Pre-empts EmergencyTurnEnd's 6s phantom-pending guard.
+        reply_secs = 5.0
+        while True:
+            await asyncio.sleep(0.5)
+            if not state.bot_pending or not state.t_bot_pending:
+                continue
+            if time.monotonic() - state.t_bot_pending <= reply_secs:
+                continue
+            # Only force a reply if the bot produced NO reply text since the turn ended. If it
+            # already generated one (text after t_bot_pending) but bot_pending got re-stuck by
+            # overlapping turn-ends, a reply IS in flight -> clear the stale flag, don't duplicate.
+            if state.t_last_bot_text >= state.t_bot_pending:
+                state.bot_pending = False
+                state.t_bot_pending = 0.0
+                continue
+            logger.warning(
+                f"REPLY_WATCHDOG: bot owed a reply >{reply_secs}s (no reply text) — forcing via LLMRunFrame"
+            )
+            state.bot_pending = False
+            state.t_bot_pending = 0.0
+            await task.queue_frames([LLMRunFrame()])
+
     logger.info(
         f"bot ready — barge-in needs >=3 words OR >=0.7s voice; "
         f"backchannels never interrupt ({sorted(BACKCHANNEL_WORDS)})"
     )
+    reply_wd = asyncio.create_task(_reply_watchdog())
     await runner.add_workers(task)
     await runner.run()
+    reply_wd.cancel()
     logger.info("bot pipeline finished")
 
 
