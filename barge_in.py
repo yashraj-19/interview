@@ -101,7 +101,12 @@ def reply_already_handled(state) -> bool:
     if state.t_last_user_text > 0 and state.t_last_bot_text >= state.t_last_user_text:
         return True
     now = time.monotonic()
-    return (state.bot_pending and now - state.t_bot_pending <= 6.0) or (
+    # bot_pending window trimmed 6.0 -> 2.5s. turn_replied (above) is the RELIABLE primary guard;
+    # bot_pending is only a secondary in-flight catch, and it's PHANTOM-prone (a turn-end can fire
+    # without a reply on a VAD/transcript race, leaving it stuck True). A real Groq reply clears it
+    # via BotStartedSpeaking in ~1s, so 2.5s covers it — while a phantom stops suppressing the next
+    # legit reply ~3.5s sooner (this caused an 8s hang before the network drop, observed live).
+    return (state.bot_pending and now - state.t_bot_pending <= 2.5) or (
         state.bot_speaking and now - state.t_bot_speaking <= 15.0
     )
 
@@ -287,6 +292,7 @@ class BargeInManager(FrameProcessor):
         if isinstance(frame, BotSpeakingFrame):
             # Playback heartbeat (~every 0.2s while the bot's audio actually plays).
             self._t_last_bot_heartbeat = time.monotonic()
+            self._state.t_reply_text = time.monotonic()  # audio playing -> reply PROGRESS
             await self.push_frame(frame, direction)
             return
 
@@ -300,6 +306,7 @@ class BargeInManager(FrameProcessor):
             if self._turn_ended:
                 self._state.turn_replied = False
                 self._state.judge_corrected_this_turn = False
+                self._state.t_reply_claimed = 0.0   # disarm the stall watchdog for the fresh turn
                 self._turn_ended = False
             # Fragment stitching: the user resumed AFTER the turn ended but BEFORE
             # the bot started speaking -> cancel the pending reply so the new speech
@@ -337,16 +344,19 @@ class BargeInManager(FrameProcessor):
                 # speak via TTS). That counts as a reply for the reply-watchdog gate, so it won't
                 # force a duplicate after a judge cut-in (which never produces an LLMTextFrame).
                 self._state.t_last_bot_text = time.monotonic()
+                self._state.t_reply_text = time.monotonic()  # reply PROGRESS (un-stalls the watchdog)
         elif isinstance(frame, LLMTextFrame):
             if frame.text:
                 self._generated.append(frame.text)
                 self._state.t_last_bot_text = time.monotonic()  # reply text produced (reply-watchdog gate)
+                self._state.t_reply_text = time.monotonic()     # reply PROGRESS (un-stalls the watchdog)
         elif isinstance(frame, BotStartedSpeakingFrame):
             self._bot_pending = False
             self._stitch_locked = False  # bot is speaking -> stitching may re-arm
             self._state.bot_speaking = True
             self._state.bot_pending = False
             self._state.t_bot_speaking = time.monotonic()
+            self._state.t_reply_text = time.monotonic()  # bot audio started -> reply PROGRESS
             self._t_last_bot_heartbeat = time.monotonic()
             if self._t_user_stopped:
                 latency = (time.monotonic() - self._t_user_stopped) * 1000
@@ -535,8 +545,10 @@ class EmergencyTurnEnd(BaseUserTurnStopStrategy):
         # paths, where the bot is not legitimately speaking.
         if self._on_resync:
             self._on_resync()
+        now = time.monotonic()
         self._state.turn_replied = True                 # CLAIM the turn (latch + timestamp)
-        self._state.t_last_bot_text = time.monotonic()  # anti-race; backstop for reply watchdog
+        self._state.t_last_bot_text = now               # anti-race; backstop for reply watchdog
+        self._state.t_reply_claimed = now               # arm the stall watchdog for this reply
         self._state.last_turn_trigger = trigger
         self._has_transcript = False
         logger.warning(message)
@@ -752,8 +764,10 @@ class TranscriptRuleTurnEnd(BaseUserTurnStopStrategy):
         # CLAIM the turn SYNCHRONOUSLY (no await before this) so the judge / watchdog see it and
         # don't also respond. The latch is the real guard (survives late STT fragments); the
         # timestamp stamp is a backstop for the transcript-driven reply watchdog.
+        now = time.monotonic()
         self._state.turn_replied = True
-        self._state.t_last_bot_text = time.monotonic()
+        self._state.t_last_bot_text = now
+        self._state.t_reply_claimed = now   # arm the stall watchdog for this reply
         self._state.bot_pending = False
         self._state.bot_speaking = False
         await super().trigger_user_turn_stopped()

@@ -35,6 +35,7 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     Frame,
+    InterruptionFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMRunFrame,
@@ -360,11 +361,11 @@ async def run_bot(connection: SmallWebRTCConnection):
         barge.resync()
         start_strat.resync()
 
-    # Latency trim: confirm 0.7->0.5s (shaves every terminal-punct turn) and the smart-turn
-    # INCOMPLETE delay 1.0->0.6s (it was adding a full second to ~25% of turns — the main cause
-    # of the "~2s" feel). Still a buffer for genuine mid-thought pauses; if it starts cutting in
-    # while you're still talking, nudge these back up.
-    rule_stop = TranscriptRuleTurnEnd(state, confirm_secs=0.5, smart_delay_secs=0.6)
+    # Latency trim. confirm 0.35s fires the COMMON path (26/28 turns end on terminal punct) a bit
+    # faster; smart-turn INCOMPLETE delay 0.6s. silence_secs stays 2.5s ON PURPOSE — this speaker
+    # pauses ~2s between fragments, so a shorter neutral-ending backstop would cut them off mid-
+    # thought. If it ever cuts in while you're still talking, raise confirm_secs back toward 0.5.
+    rule_stop = TranscriptRuleTurnEnd(state, confirm_secs=0.35, smart_delay_secs=0.6)
     smart_observer = SmartTurnObserver(
         state,
         turn_analyzer=LoggingSmartTurn(state, params=SmartTurnParams(stop_secs=3.0)),
@@ -375,7 +376,8 @@ async def run_bot(connection: SmallWebRTCConnection):
             rule_stop,        # PRIMARY: deterministic transcript rule
             smart_observer,   # delay-only: feeds smart-turn predictions, never triggers
             EmergencyTurnEnd(
-                state, silence_secs=5.0, watchdog_secs=4.0, on_resync=_full_resync
+                state, silence_secs=5.0, watchdog_secs=4.0, pending_max=3.5,
+                on_resync=_full_resync,
             ),
         ],
     )
@@ -447,6 +449,7 @@ async def run_bot(connection: SmallWebRTCConnection):
         # (renegotiation / flaky reconnect on the same pipeline must not double-greet).
         if not greeted["done"]:
             greeted["done"] = True
+            state.t_reply_claimed = time.monotonic()   # arm stall watchdog for the greeting too
             await task.queue_frames([LLMRunFrame()])  # bot greets first
 
     @transport.event_handler("on_client_disconnected")
@@ -465,9 +468,43 @@ async def run_bot(connection: SmallWebRTCConnection):
         # before reply_secs; multi-fragment answers keep pushing t_last_user_text forward, so
         # it only fires reply_secs after you've truly stopped.)
         reply_secs = 7.0
+        stall_secs = 12.0
         while True:
             await asyncio.sleep(0.5)
             now = time.monotonic()
+
+            # STALL RECOVERY (provider-agnostic: any LLM/TTS provider, or a network blip). A reply
+            # was CLAIMED (turn-end fired / judge corrected / re-prompt) but produced ZERO output —
+            # no LLM token, no TTS text, no bot audio — for > stall_secs. The LLM/TTS/network is
+            # hung. turn_replied (correctly) blocks the reply-watchdog below while a reply is
+            # pending, so without this the bot stays silent for as long as the provider hangs
+            # (a ~74s reply stall from a network blip was seen live). Fix: cancel the stuck in-flight
+            # generation FIRST (an InterruptionFrame is a SystemFrame -> the LLM closes its stream
+            # on cancel) so its late frames can't double, then resync + re-prompt. The 12s window
+            # is far longer than any real reply (~1s), so it never fires on a normal turn.
+            if (
+                state.t_reply_claimed > 0
+                and now - state.t_reply_claimed > stall_secs
+                and state.t_reply_text < state.t_reply_claimed
+            ):
+                held = now - state.t_reply_claimed
+                logger.warning(
+                    f"STALL_RECOVERY: reply claimed {held:.0f}s ago with no output — "
+                    "cancelling stuck generation, resync + re-prompt"
+                )
+                await task.queue_frames([InterruptionFrame()])  # kill the hung generation
+                await asyncio.sleep(0.15)                        # let the cancel land before re-prompt
+                _full_resync()                                   # clear every 'bot busy' tracker
+                state.turn_replied = False
+                state.judge_corrected_this_turn = False
+                state.bot_pending = False
+                state.bot_speaking = False
+                state.t_last_bot_text = now      # don't let the reply-watchdog also fire this tick
+                state.t_reply_claimed = now       # re-arm: if the re-prompt ALSO hangs, recover again
+                # leave t_reply_text untouched (stale) so a re-prompt that also stalls is re-detected
+                await task.queue_frames([LLMRunFrame()])
+                continue
+
             # Same single anti-double gate: only force a reply if the bot has NOT already replied
             # to (or isn't mid-replying to) the latest user content, and it's overdue.
             if (
@@ -478,8 +515,9 @@ async def run_bot(connection: SmallWebRTCConnection):
                 logger.warning(
                     f"REPLY_WATCHDOG: user spoke, bot owes a reply >{reply_secs}s — forcing via LLMRunFrame"
                 )
-                state.turn_replied = True     # claim the turn (latch) so we don't re-fire it
+                state.turn_replied = True      # claim the turn (latch) so we don't re-fire it
                 state.t_last_bot_text = now    # backstop for the transcript-driven gate
+                state.t_reply_claimed = now    # arm the stall watchdog for this forced reply
                 await task.queue_frames([LLMRunFrame()])
 
     logger.info(

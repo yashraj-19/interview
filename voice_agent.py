@@ -51,7 +51,6 @@ from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
 from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.services.google.llm import GoogleLLMService
 from pipecat.services.groq.llm import GroqLLMService
-from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.local.audio import LocalAudioTransportParams
 
 from judge import JUDGE_MODEL, JUDGE_PROVIDER, judge_answer
@@ -72,21 +71,17 @@ load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
 
-# Conversation brain. Gemini's free tier (5 req/min) can't sustain live voice,
-# so we default to Groq Llama 3.3 70B (free, ~30 req/min, fast). Set
-# CONV_LLM_PROVIDER=gemini (or =openai) in .env to switch.
+# Conversation brain. Default Groq llama-4-scout (free tier, ~30 req/min, fast enough
+# for live voice). Gemini is an optional swap via CONV_LLM_PROVIDER=gemini, but its free
+# tier (5 req/min) can't sustain a live interview — enable only with billing on.
 CONV_LLM_PROVIDER = os.getenv("CONV_LLM_PROVIDER", "groq").strip().lower()
 # llama-4-scout-17b follows the "probe, never reveal the answer" rule far better
 # than 8b-instant (which kept giving answers away), and has free budget. Override
 # via GROQ_CONV_MODEL in .env (e.g. llama-3.3-70b-versatile when its cap resets).
 GROQ_CONV_MODEL = os.getenv("GROQ_CONV_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 GEMINI_MODEL = "gemini-2.5-flash"
-# gpt-4o-mini follows the never-confirm / never-reveal prompt far better than scout,
-# so the RevealGuard/REVEAL_BLOCKED safety nets fire much less. Override via OPENAI_CONV_MODEL.
-OPENAI_CONV_MODEL = os.getenv("OPENAI_CONV_MODEL", "gpt-4o-mini")
 
 TTS_VOICE = "aura-2-helena-en"  # English female Aura-2 voice
 
@@ -178,6 +173,14 @@ class ConversationState:
         # output gate (server.RevealGuard) drops any conversation reply while this is set. Cleared
         # by BargeInManager on a genuinely new turn, same as turn_replied.
         self.judge_corrected_this_turn = False
+        # STALL RECOVERY signals. t_reply_claimed = when a reply was last claimed (a turn-end
+        # fired / judge corrected / re-prompt). t_reply_text = when the bot last produced ACTUAL
+        # reply output (LLM token, TTS text, or bot audio). If a reply is claimed but produces no
+        # output for >stall window, the LLM/TTS/network is hung — the stall watchdog forces a
+        # resync + re-prompt. turn_replied (correctly) blocks the reply-watchdog while a reply is
+        # pending, so without this a hung in-flight reply leaves the bot silent indefinitely.
+        self.t_reply_claimed = 0.0
+        self.t_reply_text = 0.0
 
 
 ASK_BACK_PHRASES = (
@@ -351,6 +354,7 @@ class InterruptJudge(FrameProcessor):
                     self._state.judge_corrected_this_turn = True  # output gate drops the dup reply
                     self._state.t_judge_correction = now
                     self._state.t_last_bot_text = now
+                    self._state.t_reply_claimed = now             # arm the stall watchdog
             else:
                 # A complete answer judged not-wrong -> recovered; reset escalation.
                 self._wrong_streak = 0
@@ -497,17 +501,11 @@ class InputGate(FrameProcessor):
 
 
 def build_conversation_llm():
-    """Build the conversation LLM. Groq by default; Gemini if CONV_LLM_PROVIDER=gemini;
-    OpenAI gpt-4o-mini if CONV_LLM_PROVIDER=openai (needs OPENAI_API_KEY in .env)."""
+    """Build the conversation LLM. Groq by default; Gemini if CONV_LLM_PROVIDER=gemini."""
     if CONV_LLM_PROVIDER == "gemini":
         return GoogleLLMService(
             api_key=GEMINI_API_KEY,
             settings=GoogleLLMService.Settings(model=GEMINI_MODEL),
-        )
-    if CONV_LLM_PROVIDER == "openai":
-        return OpenAILLMService(
-            api_key=OPENAI_API_KEY,
-            settings=OpenAILLMService.Settings(model=OPENAI_CONV_MODEL),
         )
     return GroqLLMService(
         api_key=GROQ_API_KEY,
@@ -519,8 +517,6 @@ def _check_keys() -> None:
     required = [("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY)]
     if CONV_LLM_PROVIDER == "gemini":
         required.append(("GEMINI_API_KEY", GEMINI_API_KEY))
-    elif CONV_LLM_PROVIDER == "openai":
-        required.append(("OPENAI_API_KEY", OPENAI_API_KEY))
     else:
         required.append(("GROQ_API_KEY", GROQ_API_KEY))
     missing = [name for name, val in required if not val]
@@ -628,9 +624,7 @@ async def main() -> None:
     await runner.add_workers(task)
 
     logger.info("=" * 60)
-    _conv_model = {"gemini": GEMINI_MODEL, "openai": OPENAI_CONV_MODEL}.get(
-        CONV_LLM_PROVIDER, GROQ_CONV_MODEL
-    )
+    _conv_model = GEMINI_MODEL if CONV_LLM_PROVIDER == "gemini" else GROQ_CONV_MODEL
     logger.info(f"  STT : Deepgram nova-3   |  TTS : Deepgram {TTS_VOICE}")
     logger.info(f"  LLM : {CONV_LLM_PROVIDER} {_conv_model}")
     logger.info(f"  Judge: {JUDGE_PROVIDER} {JUDGE_MODEL}  (wrong-answer interrupt ON)")

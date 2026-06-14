@@ -1,5 +1,8 @@
-# SViam voice interviewer — dependencies
+# SViam voice interviewer — dependencies   (Python 3.11+)
 # Install:  venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# Pipecat is PINNED to 1.3.0 — newer releases change turn-taking / aggregator APIs
+# this codebase depends on, so don't loosen the pin without re-testing.
 #
 # Pipecat extras:
 #   deepgram = STT (nova-3) + TTS (Aura-2)
@@ -7,11 +10,11 @@
 #   silero = VAD (turn-taking, barge-in)
 #   webrtc = SmallWebRTCTransport (browser, full-duplex) + aiortc/av
 #   local  = PyAudio (deprecated local-mic path; still imported by smooth_audio.py)
-pipecat-ai[deepgram,google,groq,silero,webrtc,local]
+pipecat-ai[deepgram,google,groq,silero,webrtc,local]==1.3.0
 
 python-dotenv
 fastapi
 uvicorn[standard]
 
-# Optional: swap the judge/conversation LLM to Claude (set JUDGE_PROVIDER=anthropic)
+# Optional: swap the judge LLM to Claude (set JUDGE_PROVIDER=anthropic)
 # anthropic
