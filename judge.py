@@ -17,6 +17,7 @@ Swap providers with .env (no pipeline changes):
 
 import json
 import os
+import re
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -165,6 +166,61 @@ def _reads_as_clarification(line: str) -> bool:
     return asks_clarification and not names_error
 
 
+# --- REVEAL_BLOCKED guard (Fix #2): a CODE safety net over the small judge model, which
+# ignores the "reveal nothing on attempt 1/2" prompt instruction. If an attempt-1/2 interjection
+# contains an answer-bearing term or value, we DO NOT speak it — we swap in a content-free
+# nudge/hint. Erring toward catching reveals: this matches the common DSA giveaways, and any
+# over-match just becomes a generic (still valid) nudge. Only attempt 3 may reveal. ---
+_REVEAL_RE = re.compile(
+    r"\blifo\b|\bfifo\b"
+    r"|last[\s,-]*in[\s,-]*first[\s,-]*out|first[\s,-]*in[\s,-]*first[\s,-]*out"
+    r"|\bo\s*\(\s*1\s*\)|\bo\s*\(\s*log\s*n\s*\)|\bo\s*\(\s*n\s*log\s*n\s*\)"
+    r"|\bo\s*\(\s*n\s*\)|\bo\s*\(\s*n\s*(?:\^|\*\*|²|2)\s*\)|\bo\s*\(\s*n\s*squared\s*\)"
+    r"|constant[\s-]*time|logarithmic|linear[\s-]*time|quadratic|amortized",
+    re.IGNORECASE,
+)
+_NUDGE_LVL1 = "Are you sure about that? Walk me through your reasoning."
+_HINT_LVL2 = "That doesn't sound right to me. Think carefully, step by step, about how it actually works."
+
+
+def reveals_answer(text: str) -> bool:
+    """True if the text contains an answer-bearing DSA term/value (LIFO/FIFO, 'last in first
+    out', big-O values, complexity words). Shared by the judge's REVEAL_BLOCKED ladder and the
+    interviewer's first-clause guard (server.RevealGuard)."""
+    return bool(_REVEAL_RE.search(text or ""))
+
+
+# Confirming/denying correctness is the judge's lane ALONE (architecture rule 4: the interviewer
+# NEVER states correctness). Scout still opens with "That's generally true…" / "that's not right…"
+# despite the prompt. This catches an explicit correctness verdict in the interviewer's opener so
+# RevealGuard can swap it for a neutral redirect. Deliberately narrow — it must NOT fire on normal
+# interviewer phrasing ("that's a good start", "that's one way", "good question").
+_CONFIRM_DENY_RE = re.compile(
+    r"^\W*(?:yes|yep|yeah|no|nope|correct|incorrect|exactly|precisely|absolutely)\b[\s,.!:]"
+    r"|that(?:'s| is)\s+(?:generally\s+|basically\s+|essentially\s+|mostly\s+|absolutely\s+"
+    r"|partially\s+|not\s+quite\s+|not\s+exactly\s+|not\s+)?(?:right|correct|true|accurate|wrong|incorrect|false)"
+    r"|you(?:'re| are)\s+(?:absolutely\s+|basically\s+|partially\s+|not\s+quite\s+)?(?:right|correct|wrong|incorrect|mistaken)"
+    r"|spot[\s-]*on"
+    r"|you(?:'ve| have)?\s*got\s+it"
+    r"|that(?:'s| is)\s+(?:the\s+)?(?:right|correct)\s+(?:answer|idea|approach)",
+    re.IGNORECASE,
+)
+
+
+def confirms_or_denies(text: str) -> bool:
+    """True if the text states a correctness verdict (confirm OR deny). Used ONLY by the
+    interviewer guard (server.RevealGuard) — the judge is exempt; pushing back is its job."""
+    return bool(_CONFIRM_DENY_RE.search(text or ""))
+
+
+def _block_reveal(line: str, level: int) -> tuple[str, bool]:
+    """On attempt level 1 or 2, if the line gives away an answer term/value, swap it for a
+    content-free nudge (1) / hint (2). Returns (new_line, blocked). Level 3+ may reveal."""
+    if level >= 3 or not reveals_answer(line):
+        return line, False
+    return (_NUDGE_LVL1 if level == 1 else _HINT_LVL2), True
+
+
 async def judge_answer(question: str, answer: str, attempt: int = 1) -> dict:
     """Return {'interrupt': bool, 'line': str}. Never raises.
 
@@ -194,4 +250,13 @@ async def judge_answer(question: str, answer: str, attempt: int = 1) -> dict:
         )
         verdict["interrupt"] = False
         verdict["defer"] = True
+    # REVEAL_BLOCKED (Fix #2): never let attempt 1/2 give away the answer, even if the model tried.
+    if verdict["interrupt"]:
+        new_line, blocked = _block_reveal(verdict["line"], level)
+        if blocked:
+            logger.warning(
+                f"REVEAL_BLOCKED (attempt {level}): model tried to reveal — swapped to nudge/hint. "
+                f"was: {verdict['line']!r}"
+            )
+            verdict["line"] = new_line
     return verdict

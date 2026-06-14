@@ -19,6 +19,7 @@ live + VAD turn strategy", not a parameter.
 
 import asyncio
 import os
+import re
 import sys
 import time
 
@@ -35,6 +36,7 @@ from pipecat.frames.frames import (
     BotStoppedSpeakingFrame,
     Frame,
     LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
     LLMRunFrame,
     LLMTextFrame,
     TranscriptionFrame,
@@ -68,6 +70,8 @@ from barge_in import (
     BargeInManager,
     EmergencyTurnEnd,
     HumanBargeInStartStrategy,
+    TranscriptRuleTurnEnd,
+    reply_already_handled,
 )
 
 # --- Reused interview logic (do NOT duplicate — import from the working module) ---
@@ -79,6 +83,7 @@ from voice_agent import (
     SilenceMonitor,
     TranscriptLogger,
 )
+from judge import confirms_or_denies, reveals_answer
 
 logger.remove()
 logger.add(sys.stderr, level="INFO")
@@ -149,67 +154,139 @@ class EventBridge(FrameProcessor):
 
 
 class LoggingSmartTurn(LocalSmartTurnAnalyzerV3):
-    """Logs each smart-turn decision and tags how the turn ended (smart ML prediction
-    vs stop_secs silence fallback) on ConversationState for the per-turn summary.
-
-    _fallback_pending keeps the label honest: when append_audio reports COMPLETE on the
-    silence backstop, _handle_input_audio immediately also calls analyze_end_of_turn — we
-    must not let that overwrite "fallback" with "smart"."""
+    """smart-turn analyzer kept DELAY-ONLY (STEP 5). It records its latest INCOMPLETE/COMPLETE
+    prediction on ConversationState — consumed by TranscriptRuleTurnEnd to push a turn-end
+    LATER when it says INCOMPLETE — but it never triggers a turn-end itself (see
+    SmartTurnObserver). Its COMPLETE predictions, which mis-fired turn-ends on fragmented
+    speech, are recorded for the log but cannot end a turn."""
 
     def __init__(self, state, **kwargs):
         super().__init__(**kwargs)
         self._state = state
-        self._fallback_pending = False
 
     def append_audio(self, buffer, is_speech):
         st = super().append_audio(buffer, is_speech)
         if st == EndOfTurnState.COMPLETE:
-            self._state.last_turn_trigger = "fallback"
-            self._fallback_pending = True
-            logger.info("SMART_TURN append_audio -> COMPLETE (stop_secs silence fallback)")
+            logger.info("SMART_TURN append_audio -> COMPLETE (silence fallback) [delay-only, ignored]")
         return st
 
     async def analyze_end_of_turn(self):
         st, metrics = await super().analyze_end_of_turn()
-        if st == EndOfTurnState.COMPLETE and not self._fallback_pending:
-            self._state.last_turn_trigger = "smart"
-        self._fallback_pending = False
-        logger.info(f"SMART_TURN analyze -> {st.name}")
+        self._state.smart_turn_incomplete = st == EndOfTurnState.INCOMPLETE
+        self._state.t_smart_turn = time.monotonic()
+        logger.info(f"SMART_TURN analyze -> {st.name} [delay-only]")
         return st, metrics
 
 
-class GuardedSmartTurnStop(TurnAnalyzerUserTurnStopStrategy):
-    """Smart-turn stop strategy + double-reply DE-DUP guard.
-
-    A delayed/duplicate finalized transcript can fire a turn-end AFTER the bot has already
-    started replying (seen live: two questions back-to-back). If a reply is already speaking
-    or in flight (bot_speaking/bot_pending), suppress the turn-end so no second reply starts.
-    Safe in step 2 because user-interrupts-bot is OFF (no legitimate new turn during bot
-    speech) — revisit when full-duplex barge-in lands in step 4."""
+class SmartTurnObserver(TurnAnalyzerUserTurnStopStrategy):
+    """Keeps smart-turn RUNNING (feeds it audio + VAD so LoggingSmartTurn records predictions
+    on state) but NEVER triggers a turn-end. smart-turn is delay-only: TranscriptRuleTurnEnd
+    consults state.smart_turn_incomplete to push a turn-end later. Its early-COMPLETE
+    mispredictions — the source of premature replies + stitch breaks — can no longer end a turn."""
 
     def __init__(self, state, *, turn_analyzer, **kwargs):
         super().__init__(turn_analyzer=turn_analyzer, **kwargs)
         self._state = state
 
     async def trigger_user_turn_stopped(self):
-        # De-dup, but ONLY for a genuinely fresh in-flight reply. A bot_pending/bot_speaking
-        # flag stuck True far longer than any real generation (~6s) / spoken reply (~15s) is a
-        # PHANTOM (lost BotStoppedSpeaking on a bad link). Trusting it blindly blocks every
-        # turn-end -> "transcript arrives but she never replies". So clear stale flags and let
-        # the reply through; only a recent flag means a real reply is actually in flight.
-        now = time.monotonic()
-        busy_real = (
-            (self._state.bot_pending and now - self._state.t_bot_pending <= 6.0)
-            or (self._state.bot_speaking and now - self._state.t_bot_speaking <= 15.0)
-        )
-        if busy_real:
-            logger.info("TURN_END suppressed (smart): reply genuinely in-flight — de-dup")
+        return  # neutered: observe/predict only, never end the turn
+
+
+class RevealGuard(FrameProcessor):
+    """Interviewer NEVER reveals — corrections are the judge's lane (architecture rule). The
+    conversation LLM still leaks the answer in its OPENING clause ("a stack is actually LIFO…")
+    despite the prompt. Scout-era safety net: hold ONLY the first clause of each reply and scan
+    it; if it reveals an answer term, REPLACE the whole reply with a neutral probe (keep the
+    Start/End frames, swap the text). Clean replies stream normally — the first clause is held
+    only ~as long as the TTS aggregates a sentence anyway, so ~no added latency. Placed right
+    after the LLM so a blocked reveal is never logged or shown either."""
+
+    # NEUTRAL on purpose: it neither confirms nor denies, so it's safe whether the candidate
+    # was right or wrong. The old "that's worth reconsidering" implied WRONG — itself a
+    # correctness signal the interviewer isn't allowed to give (and flat-out misleading when the
+    # candidate was actually right, e.g. confirming an O(1) answer).
+    _PROBE = "Walk me through your reasoning step by step — I want to follow exactly how you got there."
+    _MAX_CLAUSE_CHARS = 90  # decide by here even without a sentence end
+
+    def __init__(self, state, **kwargs):
+        super().__init__(**kwargs)
+        self._state = state
+        self._buf = ""
+        self._held: list[Frame] = []
+        self._decided = False
+        self._blocked = False
+        self._drop = False  # drop the whole in-flight response (judge already handled this turn)
+
+    def _reset(self):
+        self._buf = ""
+        self._held = []
+        self._decided = False
+        self._blocked = False
+
+    async def _decide(self, direction: FrameDirection):
+        self._decided = True
+        # Block on EITHER an answer-term leak OR an explicit correctness verdict — both are the
+        # interviewer overstepping into the judge's lane. Same handling: swap for a neutral probe.
+        leaked = reveals_answer(self._buf)
+        verdicted = confirms_or_denies(self._buf)
+        if leaked or verdicted:
+            self._blocked = True
+            why = "revealed an answer" if leaked else "stated correctness"
+            logger.warning(
+                f"REVEAL_BLOCKED (interviewer): opener {why} — replaced reply with a neutral probe. "
+                f"was: {self._buf!r}"
+            )
+            # Keep the Start (preserve Start/End pairing); swap the whole reply for a probe.
+            for f in self._held:
+                if isinstance(f, LLMFullResponseStartFrame):
+                    await self.push_frame(f, direction)
+            await self.push_frame(LLMTextFrame(text=self._PROBE), direction)
+        else:
+            for f in self._held:
+                await self.push_frame(f, direction)
+        self._held = []
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, LLMFullResponseStartFrame):
+            # ANTI-DOUBLE OUTPUT GATE. If the judge already corrected this turn, the interviewer
+            # must NOT also reply. The strategy-level latch suppresses the turn-end, but the
+            # aggregator's user_turn_stop_timeout (5s) then FORCE-FIRES the conversation LLM past
+            # it — that's the judge-correction-then-interviewer-reply double seen live. This is the
+            # last chokepoint before the reply is logged/spoken/recorded: drop the whole response.
+            if self._state.judge_corrected_this_turn:
+                self._drop = True
+                logger.info(
+                    "REPLY_DROPPED (interviewer): judge already corrected this turn — "
+                    "dropping the duplicate conversation reply"
+                )
+                return
+            self._drop = False
+            self._reset()
+            self._held.append(frame)  # hold until the first clause is scanned
             return
-        if self._state.bot_pending or self._state.bot_speaking:
-            logger.info("TURN_END: clearing stale phantom bot flag, proceeding with reply")
-            self._state.bot_pending = False
-            self._state.bot_speaking = False
-        await super().trigger_user_turn_stopped()
+        if self._drop:
+            # Swallow the dropped response's body (text + end marker) so nothing reaches TTS /
+            # the assistant context. Leave non-LLM frames (judge TTSSpeakFrame, control) untouched.
+            if isinstance(frame, LLMFullResponseEndFrame):
+                self._drop = False
+                return
+            if isinstance(frame, LLMTextFrame):
+                return
+        if isinstance(frame, LLMTextFrame):
+            if not self._decided:
+                self._buf += frame.text or ""
+                self._held.append(frame)
+                if re.search(r"[.?!]", self._buf) or len(self._buf) >= self._MAX_CLAUSE_CHARS:
+                    await self._decide(direction)
+                return
+            if self._blocked:
+                return  # drop the rest of the original (revealing) reply; probe already sent
+            await self.push_frame(frame, direction)
+            return
+        if isinstance(frame, LLMFullResponseEndFrame) and not self._decided:
+            await self._decide(direction)  # short reply ended before the first clause completed
+        await self.push_frame(frame, direction)
 
 
 # ---------------------------------------------------------------------------
@@ -265,19 +342,13 @@ async def run_bot(connection: SmallWebRTCConnection):
     start_strat = HumanBargeInStartStrategy(
         min_words=3, sustained_secs=0.7, enable_interruptions=True
     )
-    # Turn END (STEP 2): smart-turn-v3 ML analyzer OWNS the normal decision — it waits
-    # through mid-sentence pauses (predicts INCOMPLETE) and ends the turn once you're
-    # actually done (COMPLETE), with a 3.0s silence backstop (> ~2.5s natural pauses, spec
-    # §3). GuardedSmartTurnStop adds the double-reply de-dup guard.
-    #
-    # EmergencyTurnEnd from STEP 1 stays UNDERNEATH as the reliability backstop. Its
-    # transcript-driven timer is raised to 5.0s (> smart-turn's 3.0s) so it NEVER preempts
-    # smart-turn — it only fires if smart-turn never ends the turn (e.g. degraded audio
-    # starves smart-turn's audio-frame silence backstop). Its phantom-flag watchdog
-    # (bot_pending stuck >6s / bot_speaking >15s) still catches lost-reply stuck states.
-    # Layering: smart ML (fast) -> smart 3s silence -> watchdog 5s -> phantom guard.
-    # Both strategies run in parallel (first to fire ends the turn); reset() cancels the
-    # loser and the de-dup guard prevents a double reply.
+    # Turn END (STEP 5): deterministic TranscriptRuleTurnEnd is PRIMARY — smart-turn's ML
+    # mispredicted BOTH ways on this speech (false COMPLETE on fragments -> premature replies
+    # + stitch breaks; false INCOMPLETE on complete sentences -> 30s hangs). Rule: terminal
+    # punctuation + ~1s confirm = done; continuation token (comma/conj/prep/article/aux/-ing)
+    # = wait; 2.5s silence backstop otherwise. smart-turn is kept as a DELAY-ONLY observer
+    # (SmartTurnObserver never triggers; LoggingSmartTurn records INCOMPLETE so the rule can
+    # push a turn-end later). EmergencyTurnEnd (5s) + phantom guard + reply watchdog = floor.
     # on_bot_idle: when the playback-heartbeat reconciler detects the bot actually stopped
     # (transport skipped BotStoppedSpeaking), also clear the start strategy's private flag.
     barge = BargeInManager(state, on_bot_idle=start_strat.resync)
@@ -289,14 +360,20 @@ async def run_bot(connection: SmallWebRTCConnection):
         barge.resync()
         start_strat.resync()
 
-    smart_stop = GuardedSmartTurnStop(
+    # Latency trim: confirm 0.7->0.5s (shaves every terminal-punct turn) and the smart-turn
+    # INCOMPLETE delay 1.0->0.6s (it was adding a full second to ~25% of turns — the main cause
+    # of the "~2s" feel). Still a buffer for genuine mid-thought pauses; if it starts cutting in
+    # while you're still talking, nudge these back up.
+    rule_stop = TranscriptRuleTurnEnd(state, confirm_secs=0.5, smart_delay_secs=0.6)
+    smart_observer = SmartTurnObserver(
         state,
         turn_analyzer=LoggingSmartTurn(state, params=SmartTurnParams(stop_secs=3.0)),
     )
     turn_strategies = UserTurnStrategies(
         start=[start_strat],
         stop=[
-            smart_stop,
+            rule_stop,        # PRIMARY: deterministic transcript rule
+            smart_observer,   # delay-only: feeds smart-turn predictions, never triggers
             EmergencyTurnEnd(
                 state, silence_secs=5.0, watchdog_secs=4.0, on_resync=_full_resync
             ),
@@ -338,6 +415,7 @@ async def run_bot(connection: SmallWebRTCConnection):
             SilenceMonitor(),         # silence auto-prompt
             aggregator.user(),
             llm,
+            RevealGuard(state),       # interviewer never reveals: scan opening clause, swap to probe
             TranscriptLogger(state),  # BOT> logging + records last question
             EventBridge(role="out"),  # bot reply text -> UI
             tts,
@@ -377,30 +455,32 @@ async def run_bot(connection: SmallWebRTCConnection):
         await runner.cancel()
 
     async def _reply_watchdog():
-        # Demo-critical safety: if a user turn ended (bot_pending) but no reply lands within
-        # reply_secs — e.g. a startup reconnect ate the first turn, or an interrupt left the
-        # turn-stop without a reply — FORCE one via LLMRunFrame instead of sitting silent until
-        # the 30s silence prompt. Pre-empts EmergencyTurnEnd's 6s phantom-pending guard.
-        reply_secs = 5.0
+        # Demo-critical safety, TRANSCRIPT-DRIVEN (independent of the turn-state flags). A
+        # smart-turn mispredict + stitch can break the turn so the forced turn-end produces no
+        # reply, no UserStoppedSpeaking, and no bot_pending — so a flag-based watchdog never
+        # arms and the bot sits silent until the 30s prompt. Instead: if the user has spoken
+        # MORE RECENTLY than the bot last produced reply text, the bot is not speaking, and
+        # reply_secs pass with still no reply -> force one via LLMRunFrame. (t_last_bot_text
+        # updates on the first reply token, so a normal/slow-but-working reply clears this
+        # before reply_secs; multi-fragment answers keep pushing t_last_user_text forward, so
+        # it only fires reply_secs after you've truly stopped.)
+        reply_secs = 7.0
         while True:
             await asyncio.sleep(0.5)
-            if not state.bot_pending or not state.t_bot_pending:
-                continue
-            if time.monotonic() - state.t_bot_pending <= reply_secs:
-                continue
-            # Only force a reply if the bot produced NO reply text since the turn ended. If it
-            # already generated one (text after t_bot_pending) but bot_pending got re-stuck by
-            # overlapping turn-ends, a reply IS in flight -> clear the stale flag, don't duplicate.
-            if state.t_last_bot_text >= state.t_bot_pending:
-                state.bot_pending = False
-                state.t_bot_pending = 0.0
-                continue
-            logger.warning(
-                f"REPLY_WATCHDOG: bot owed a reply >{reply_secs}s (no reply text) — forcing via LLMRunFrame"
-            )
-            state.bot_pending = False
-            state.t_bot_pending = 0.0
-            await task.queue_frames([LLMRunFrame()])
+            now = time.monotonic()
+            # Same single anti-double gate: only force a reply if the bot has NOT already replied
+            # to (or isn't mid-replying to) the latest user content, and it's overdue.
+            if (
+                not reply_already_handled(state)
+                and state.t_last_user_text > 0
+                and now - state.t_last_user_text > reply_secs
+            ):
+                logger.warning(
+                    f"REPLY_WATCHDOG: user spoke, bot owes a reply >{reply_secs}s — forcing via LLMRunFrame"
+                )
+                state.turn_replied = True     # claim the turn (latch) so we don't re-fire it
+                state.t_last_bot_text = now    # backstop for the transcript-driven gate
+                await task.queue_frames([LLMRunFrame()])
 
     logger.info(
         f"bot ready — barge-in needs >=3 words OR >=0.7s voice; "

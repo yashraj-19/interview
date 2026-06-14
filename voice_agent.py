@@ -51,6 +51,7 @@ from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
 from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.services.google.llm import GoogleLLMService
 from pipecat.services.groq.llm import GroqLLMService
+from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.local.audio import LocalAudioTransportParams
 
 from judge import JUDGE_MODEL, JUDGE_PROVIDER, judge_answer
@@ -71,17 +72,21 @@ load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
 
 # Conversation brain. Gemini's free tier (5 req/min) can't sustain live voice,
 # so we default to Groq Llama 3.3 70B (free, ~30 req/min, fast). Set
-# CONV_LLM_PROVIDER=gemini in .env to switch back once Gemini billing is enabled.
+# CONV_LLM_PROVIDER=gemini (or =openai) in .env to switch.
 CONV_LLM_PROVIDER = os.getenv("CONV_LLM_PROVIDER", "groq").strip().lower()
 # llama-4-scout-17b follows the "probe, never reveal the answer" rule far better
 # than 8b-instant (which kept giving answers away), and has free budget. Override
 # via GROQ_CONV_MODEL in .env (e.g. llama-3.3-70b-versatile when its cap resets).
 GROQ_CONV_MODEL = os.getenv("GROQ_CONV_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 GEMINI_MODEL = "gemini-2.5-flash"
+# gpt-4o-mini follows the never-confirm / never-reveal prompt far better than scout,
+# so the RevealGuard/REVEAL_BLOCKED safety nets fire much less. Override via OPENAI_CONV_MODEL.
+OPENAI_CONV_MODEL = os.getenv("OPENAI_CONV_MODEL", "gpt-4o-mini")
 
 TTS_VOICE = "aura-2-helena-en"  # English female Aura-2 voice
 
@@ -108,15 +113,21 @@ YOUR JOB:
 - When an answer is vague, ask "why" or "can you be more specific".
 - Be professional, warm, and curious about HOW they think, not just the answer.
 
-NEVER GIVE AWAY ANSWERS (very important):
-- NEVER state the correct answer, value, complexity, definition, or optimal approach. Not even
-  after several attempts. Revealing the answer is handled by a separate system, never by you.
-- If the candidate is wrong, do NOT correct them with the answer. Briefly note that something
-  seems off and ask a question that leads them to reconsider and find it themselves.
-- If their answer works but is suboptimal (e.g. brute force), ASK whether they can do better or
-  improve the complexity. Do NOT tell them the optimization.
-- Do not confirm or deny specific values (e.g. never say "it's actually O(n)"). Just probe.
-- You probe; the candidate solves. Make them do the thinking.
+NEVER CONFIRM, DENY, OR STATE CORRECTNESS — this is a hard architecture rule:
+- You are FORBIDDEN from stating, confirming, denying, correcting, or hinting at the correctness
+  of ANY fact, value, complexity, term, or definition. Wrong claims are NOT your job — a separate
+  judge owns every correction. Your ONLY tools are questions and probes.
+- If the candidate says something wrong, do NOT say it is wrong, do NOT name the right answer, do
+  NOT say "actually it's X" or "that's not quite right, it's Y". Instead ask a neutral question
+  that makes THEM re-examine it ("Walk me through how that works." / "What happens in the worst
+  case?"). NEVER state LIFO/FIFO, "last in first out", O(1)/O(n)/O(log n), or any definition.
+- Do NOT repeat, echo, adopt, or build on the candidate's claim as if it were TRUE. Treat every
+  claim they make as UNVERIFIED. If they said "O(log n)", never say "even though it's O(log n)"
+  or "since it's O(log n)…" — ask neutrally instead ("what's the average-case complexity, and
+  why do you think so?"). Endorsing their wrong value is as bad as revealing the right one.
+- If their answer works but is suboptimal, ASK whether they can do better — never name the fix.
+- Do not confirm a correct answer either (no "yes, that's right"). Stay neutral; keep probing.
+- You probe; the candidate solves. If you are ever about to state a fact, ask a question instead.
 
 HANDLING THE CANDIDATE'S META-REQUESTS:
 - If they ask you to repeat or clarify ("can you repeat that?", "what do you mean?", "I didn't
@@ -148,6 +159,25 @@ class ConversationState:
         self.t_bot_speaking = 0.0    # monotonic time bot_speaking last went True (phantom-flag guard)
         self.t_bot_pending = 0.0     # monotonic time bot_pending last went True (phantom-flag guard)
         self.t_last_bot_text = 0.0   # monotonic time the bot last produced reply text (LLMTextFrame)
+        self.t_last_user_text = 0.0  # monotonic time of the last finalized user transcript (reply watchdog)
+        self.smart_turn_incomplete = False  # smart-turn's latest prediction (DELAY-ONLY secondary)
+        self.t_smart_turn = 0.0      # monotonic time smart-turn last predicted (freshness for the delay veto)
+        self.t_judge_correction = 0.0  # monotonic time the judge last cut in with a correction
+                                       # (suppresses a duplicate conversation reply to the same turn)
+        # PER-TURN anti-double latch. True once ANY responder (judge, conversation turn-end,
+        # watchdog, silence prompt) has replied to the CURRENT user turn. Immune to the
+        # multi-fragment STT problem that broke the timestamp gate: late finals of the SAME
+        # utterance (this user pauses between words) used to bump t_last_user_text past the
+        # claim and re-open the gate, letting EmergencyTurnEnd fire a duplicate ~5s later.
+        # Cleared by BargeInManager ONLY when a genuinely NEW user turn begins (VAD start after
+        # a turn-end), so trailing fragments can never re-open it. See reply_already_handled().
+        self.turn_replied = False
+        # Set when the JUDGE corrects the current turn. The interviewer (conversation LLM) must
+        # then NOT also reply — but the aggregator's user_turn_stop_timeout (5s) force-fires the
+        # LLM when every turn-end strategy suppresses, bypassing the strategy-level latch. So the
+        # output gate (server.RevealGuard) drops any conversation reply while this is set. Cleared
+        # by BargeInManager on a genuinely new turn, same as turn_replied.
+        self.judge_corrected_this_turn = False
 
 
 ASK_BACK_PHRASES = (
@@ -298,12 +328,29 @@ class InterruptJudge(FrameProcessor):
             action = "interrupt" if verdict.get("interrupt") else "continue"
             logger.info(f"JUDGE call -> verdict={action} ms={ms:.0f} attempt={attempt}")
             if verdict.get("interrupt") and verdict.get("line"):
-                if not self._interrupted:
+                # Anti-double: defer ONLY if the conversation reply already claimed THIS turn
+                # (the per-turn latch) — that's the case where both would speak and it reads as a
+                # double. The judge usually wins this race (it fires ~0.5s; the rule waits ~0.7s
+                # confirm). The latch is the right signal here too: it's set by the conversation
+                # turn-end and is immune to the multi-fragment STT race. A still-playing PRIOR
+                # reply does NOT set it for the new turn, so a brand-new wrong claim is still
+                # correctable.
+                if self._state.turn_replied:
+                    logger.info("JUDGE deferred: conversation already replied to this turn")
+                elif not self._interrupted:
                     self._interrupted = True       # at most one interrupt per answer
                     self._wrong_streak += 1        # escalate next time on this topic
                     line = verdict["line"]
                     logger.warning(f"INTERRUPT (attempt {attempt})> {line}")
                     await self.push_frame(TTSSpeakFrame(text=line, append_to_context=True))
+                    # The judge's correction IS the bot's reply to this turn -> CLAIM it now so the
+                    # single anti-double gate (reply_already_handled) immediately suppresses a
+                    # duplicate conversation reply for the same turn, with no TTS-timing race.
+                    now = time.monotonic()
+                    self._state.turn_replied = True
+                    self._state.judge_corrected_this_turn = True  # output gate drops the dup reply
+                    self._state.t_judge_correction = now
+                    self._state.t_last_bot_text = now
             else:
                 # A complete answer judged not-wrong -> recovered; reset escalation.
                 self._wrong_streak = 0
@@ -450,11 +497,17 @@ class InputGate(FrameProcessor):
 
 
 def build_conversation_llm():
-    """Build the conversation LLM. Groq by default; Gemini if CONV_LLM_PROVIDER=gemini."""
+    """Build the conversation LLM. Groq by default; Gemini if CONV_LLM_PROVIDER=gemini;
+    OpenAI gpt-4o-mini if CONV_LLM_PROVIDER=openai (needs OPENAI_API_KEY in .env)."""
     if CONV_LLM_PROVIDER == "gemini":
         return GoogleLLMService(
             api_key=GEMINI_API_KEY,
             settings=GoogleLLMService.Settings(model=GEMINI_MODEL),
+        )
+    if CONV_LLM_PROVIDER == "openai":
+        return OpenAILLMService(
+            api_key=OPENAI_API_KEY,
+            settings=OpenAILLMService.Settings(model=OPENAI_CONV_MODEL),
         )
     return GroqLLMService(
         api_key=GROQ_API_KEY,
@@ -466,6 +519,8 @@ def _check_keys() -> None:
     required = [("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY)]
     if CONV_LLM_PROVIDER == "gemini":
         required.append(("GEMINI_API_KEY", GEMINI_API_KEY))
+    elif CONV_LLM_PROVIDER == "openai":
+        required.append(("OPENAI_API_KEY", OPENAI_API_KEY))
     else:
         required.append(("GROQ_API_KEY", GROQ_API_KEY))
     missing = [name for name, val in required if not val]
@@ -573,7 +628,9 @@ async def main() -> None:
     await runner.add_workers(task)
 
     logger.info("=" * 60)
-    _conv_model = GEMINI_MODEL if CONV_LLM_PROVIDER == "gemini" else GROQ_CONV_MODEL
+    _conv_model = {"gemini": GEMINI_MODEL, "openai": OPENAI_CONV_MODEL}.get(
+        CONV_LLM_PROVIDER, GROQ_CONV_MODEL
+    )
     logger.info(f"  STT : Deepgram nova-3   |  TTS : Deepgram {TTS_VOICE}")
     logger.info(f"  LLM : {CONV_LLM_PROVIDER} {_conv_model}")
     logger.info(f"  Judge: {JUDGE_PROVIDER} {JUDGE_MODEL}  (wrong-answer interrupt ON)")

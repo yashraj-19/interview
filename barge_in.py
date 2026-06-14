@@ -70,6 +70,42 @@ def nonbackchannel_word_count(text: str) -> int:
     return len([w for w in norm.split() if w not in BACKCHANNEL_WORDS])
 
 
+# Explicit interrupt words: "stop, let me speak". These cut the bot off even on ONE word,
+# bypassing the >=3-word barge-in gate (a clipped single "wait" should stop her).
+_CUT_IN_WORDS = {
+    "wait", "stop", "hold", "hang", "sorry", "actually", "no", "hey", "pause", "excuse",
+}
+
+
+def is_cut_in(text: str) -> bool:
+    """True if the utterance OPENS with an explicit interrupt word (first word only, so a
+    mid-sentence 'no'/'actually' in normal speech doesn't trip it)."""
+    norm = _normalize(text)
+    return bool(norm) and norm.split()[0] in _CUT_IN_WORDS
+
+
+def reply_already_handled(state) -> bool:
+    """THE single anti-double gate — consulted by EVERY turn-end path (transcript rule,
+    EmergencyTurnEnd watchdog, reply watchdog) and the judge. Suppress a reply when the bot has
+    ALREADY replied to the CURRENT user turn, so a second/third reply can't fire. True when any:
+      - PRIMARY: the per-turn latch is set (state.turn_replied) — a responder already answered
+        this turn. This is immune to the multi-fragment STT race: late finals of the SAME
+        utterance (this user pauses between words) used to bump t_last_user_text past the claim
+        and re-open the timestamp gate, letting EmergencyTurnEnd fire a duplicate ~5s later. The
+        latch is cleared ONLY when a genuinely NEW user turn begins (BargeInManager), so trailing
+        fragments cannot re-open it.
+      - the bot produced reply text at/after the user's last transcript (kept as a backstop); OR
+      - a reply is genuinely in flight (recent bot_pending 'thinking' or bot_speaking)."""
+    if state.turn_replied:
+        return True
+    if state.t_last_user_text > 0 and state.t_last_bot_text >= state.t_last_user_text:
+        return True
+    now = time.monotonic()
+    return (state.bot_pending and now - state.t_bot_pending <= 6.0) or (
+        state.bot_speaking and now - state.t_bot_speaking <= 15.0
+    )
+
+
 class HumanBargeInStartStrategy(BaseUserTurnStartStrategy):
     """Turn-start that makes barge-in feel intentional, not hair-trigger.
 
@@ -159,6 +195,10 @@ class HumanBargeInStartStrategy(BaseUserTurnStartStrategy):
             if not self._bot_speaking:
                 await self._fire()  # normal turn: any words start it
                 return ProcessFrameResult.STOP
+            if is_cut_in(frame.text):
+                logger.debug("barge-in: explicit interrupt word (cut in on 1 word)")
+                await self._fire()  # "wait"/"stop"/"hold on" -> cut in immediately
+                return ProcessFrameResult.STOP
             if nonbackchannel_word_count(frame.text) >= self._min_words:
                 await self._fire()  # barge-in: enough real words
                 return ProcessFrameResult.STOP
@@ -207,6 +247,12 @@ class BargeInManager(FrameProcessor):
         self._awaiting_cut = False
         self._bot_pending = False    # turn ended, LLM running, bot not speaking yet
         self._stitch_locked = False  # stitch at most once per cycle (until bot speaks)
+        # Per-turn anti-double latch bookkeeping. _turn_ended gates clearing state.turn_replied:
+        # we only treat a VAD-start as a NEW turn (and re-open the gate) if the previous turn has
+        # actually ended. Starts True so the very first user turn is treated as fresh. This is
+        # what makes the latch immune to mid-utterance VAD flicker and to a judge correction's
+        # BotStartedSpeaking landing while the user is still talking the same wrong claim.
+        self._turn_ended = True
         # Bot-playback heartbeat reconciler (SOURCE fix for the BotStoppedSpeaking desync).
         # The output transport emits BotSpeakingFrame every 0.2s ONLY while audio actually
         # plays. If state.bot_speaking is True but that heartbeat has stopped for bot_idle_secs,
@@ -247,6 +293,14 @@ class BargeInManager(FrameProcessor):
         if isinstance(frame, VADUserStartedSpeakingFrame):
             self._t_vad = time.monotonic()
             self._user_speaking = True
+            # NEW TURN -> re-open the anti-double gate, but ONLY if the previous turn actually
+            # ended. A mid-utterance VAD restart (this user pauses between words) or a judge
+            # correction's BotStartedSpeaking does NOT end the turn, so the latch holds and a
+            # trailing fragment can't trigger a duplicate reply.
+            if self._turn_ended:
+                self._state.turn_replied = False
+                self._state.judge_corrected_this_turn = False
+                self._turn_ended = False
             # Fragment stitching: the user resumed AFTER the turn ended but BEFORE
             # the bot started speaking -> cancel the pending reply so the new speech
             # stitches onto the answer (bot replies once, when the user is truly done).
@@ -272,9 +326,17 @@ class BargeInManager(FrameProcessor):
             self._t_pending = time.monotonic()
             self._state.bot_pending = True
             self._state.t_bot_pending = self._t_pending
+            # The turn has now genuinely ended: the NEXT VAD-start is a new turn that may re-open
+            # the anti-double gate. (Trailing STT finals of THIS utterance arrive without a new
+            # VAD-start, so they still can't re-open it.)
+            self._turn_ended = True
         elif isinstance(frame, TTSTextFrame):
             if frame.text:
                 self._spoken.append(frame.text)
+                # The bot SPOKE something (LLM reply OR judge correction OR silence prompt — all
+                # speak via TTS). That counts as a reply for the reply-watchdog gate, so it won't
+                # force a duplicate after a judge cut-in (which never produces an LLMTextFrame).
+                self._state.t_last_bot_text = time.monotonic()
         elif isinstance(frame, LLMTextFrame):
             if frame.text:
                 self._generated.append(frame.text)
@@ -459,12 +521,22 @@ class EmergencyTurnEnd(BaseUserTurnStopStrategy):
         self._monitor = asyncio.create_task(self._monitor_turn())
 
     async def _end_turn(self, trigger: str, message: str):
+        # THE single anti-double gate (rule + watchdog + reply-watchdog all consult it). If the
+        # bot already replied to the latest user content (incl. a judge correction), this forced
+        # reply would be a duplicate -> suppress. This is the backstop path the doubles slipped
+        # through before (it fired a 2nd reply ~5s after the rule already answered).
+        if reply_already_handled(self._state):
+            logger.info("TURN_REPLY_SUPPRESSED path=watchdog: bot already replied to this turn")
+            self._has_transcript = False
+            return
         # Full resync FIRST: clear any stuck 'bot speaking' state across ALL trackers so the
         # forced turn-end actually produces a reply (a phantom start-strategy flag otherwise
         # blocks the turn from starting). Safe here — _end_turn only runs on watchdog/backstop
         # paths, where the bot is not legitimately speaking.
         if self._on_resync:
             self._on_resync()
+        self._state.turn_replied = True                 # CLAIM the turn (latch + timestamp)
+        self._state.t_last_bot_text = time.monotonic()  # anti-race; backstop for reply watchdog
         self._state.last_turn_trigger = trigger
         self._has_transcript = False
         logger.warning(message)
@@ -532,5 +604,171 @@ class EmergencyTurnEnd(BaseUserTurnStopStrategy):
         if isinstance(frame, TranscriptionFrame) and frame.text.strip():
             self._has_transcript = True
             self._t_last_transcript = time.monotonic()
+            self._state.t_last_user_text = self._t_last_transcript  # for the transcript-driven reply watchdog
             self._restart()
+        return ProcessFrameResult.CONTINUE
+
+
+# ---------------------------------------------------------------------------
+# Transcript-rule turn-end (PRIMARY). smart-turn's ML mispredicts on this speech in BOTH
+# directions (false COMPLETE on fragments -> premature replies + stitch break; false
+# INCOMPLETE on complete sentences -> 30s hangs). Deepgram smart_format punctuation is a far
+# more honest, inspectable end-of-utterance signal here. Rule: terminal punctuation (after a
+# short confirm-silence) = done; a continuation token at the end = wait; else a 2.5s silence
+# backstop = done. smart-turn is kept ONLY as a delay-only secondary.
+# ---------------------------------------------------------------------------
+_CONJUNCTIONS = {
+    "and", "but", "or", "so", "because", "nor", "yet", "while", "if", "when", "since",
+    "although", "though", "unless", "as", "whereas", "plus", "also", "then", "that", "which",
+}
+_PREPOSITIONS = {
+    "in", "on", "at", "to", "for", "with", "of", "from", "by", "about", "into", "onto", "over",
+    "under", "between", "through", "during", "before", "after", "above", "below", "near", "off",
+    "without", "within", "upon", "per", "like", "than", "toward", "towards", "around",
+}
+_ARTICLES_DET = {
+    "a", "an", "the", "my", "your", "his", "her", "their", "its", "our", "this", "these", "those",
+}
+_AUX_BARE_VERBS = {
+    "is", "are", "was", "were", "be", "been", "being", "am", "have", "has", "had", "do", "does",
+    "did", "will", "would", "shall", "should", "can", "could", "may", "might", "must",
+    "i'm", "i've", "i'd", "it's", "that's", "there's", "we're", "they're", "you're", "i'll",
+}
+_CONTINUATION_TOKENS = _CONJUNCTIONS | _PREPOSITIONS | _ARTICLES_DET | _AUX_BARE_VERBS
+
+
+def ends_in_terminal_punct(text: str) -> str:
+    """Terminal punctuation char if the utterance ends in . ? ! else ''."""
+    t = text.rstrip()
+    return t[-1] if t.endswith((".", "?", "!")) else ""
+
+
+def ends_in_continuation(text: str) -> str:
+    """Trailing continuation token if the utterance ends mid-thought (-> WAIT), else ''.
+    Covers a trailing comma (mid-clause/list), and a last word that is a conjunction,
+    preposition, article/determiner, auxiliary/contraction verb, or gerund/dangling verb (-ing)."""
+    t = text.rstrip()
+    if t.endswith(","):
+        return ","  # trailing comma -> mid-clause, keep waiting
+    norm = re.sub(r"[^\w\s'-]", "", t.lower()).strip()
+    if not norm:
+        return ""
+    last = norm.split()[-1]
+    if last in _CONTINUATION_TOKENS:
+        return last
+    if last.endswith("ing") and len(last) > 4:  # gerund / dangling verb: "building", "brushing"
+        return last
+    return ""
+
+
+class TranscriptRuleTurnEnd(BaseUserTurnStopStrategy):
+    """PRIMARY turn-end: deterministic, inspectable, transcript-driven.
+
+    - terminal punctuation (. ? !) + `confirm_secs` of silence -> DONE (the confirm window
+      absorbs multi-sentence answers and spurious mid-thought periods).
+    - a continuation token at the end -> WAIT (never fire; defer to a later transcript or the
+      EmergencyTurnEnd floor).
+    - otherwise -> DONE on `silence_secs` of silence (neutral-ending backstop).
+
+    smart-turn is DELAY-ONLY: if it currently predicts INCOMPLETE we push the turn-end one
+    `smart_delay_secs` window later (once), never earlier — its COMPLETE predictions are
+    ignored. De-dup guard + EmergencyTurnEnd/reply watchdog remain the floors.
+    """
+
+    def __init__(
+        self,
+        state,
+        *,
+        confirm_secs: float = 0.7,
+        silence_secs: float = 2.5,
+        smart_delay_secs: float = 1.0,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self._state = state
+        self._confirm_secs = confirm_secs
+        self._silence_secs = silence_secs
+        self._smart_delay_secs = smart_delay_secs
+        self._accum = ""
+        self._timer: asyncio.Task | None = None
+        self._delayed = False
+
+    async def reset(self):
+        await super().reset()
+        self._accum = ""
+        self._delayed = False
+        self._cancel()
+
+    async def cleanup(self):
+        self._cancel()
+        await super().cleanup()
+
+    def _cancel(self):
+        if self._timer and not self._timer.done():
+            self._timer.cancel()
+        self._timer = None
+
+    def _arm(self, delay: float):
+        self._cancel()
+        self._timer = asyncio.create_task(self._fire_after(delay))
+
+    async def _fire_after(self, delay: float):
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        await self._decide()
+
+    async def _decide(self):
+        text = self._accum.strip()
+        punct = ends_in_terminal_punct(text)
+        token = ends_in_continuation(text)
+        # smart-turn DELAY-ONLY: if it just said INCOMPLETE, push the turn-end one window later
+        # (once). Its COMPLETE predictions are ignored. Floors below cap any hang.
+        smart_incomplete = (
+            self._state.smart_turn_incomplete
+            and (time.monotonic() - self._state.t_smart_turn) < 3.0
+        )
+        if smart_incomplete and not self._delayed:
+            self._delayed = True
+            logger.info(
+                f"TURN_RULE delay=smart-turn-INCOMPLETE wait={self._smart_delay_secs}s "
+                f"end='{token or 'neutral'}'"
+            )
+            self._arm(self._smart_delay_secs)
+            return
+        trigger = "terminal-punct" if punct else "silence-backstop"
+        end_desc = f"punct:{punct}" if punct else (token or "neutral")
+        logger.info(f"TURN_RULE fire trigger={trigger} end='{end_desc}' smart_delayed={self._delayed}")
+        self._state.last_turn_trigger = trigger
+        self._delayed = False
+        await self.trigger_user_turn_stopped()
+
+    async def trigger_user_turn_stopped(self):
+        # THE single anti-double gate (rule + watchdog + reply-watchdog all consult it).
+        if reply_already_handled(self._state):
+            logger.info("TURN_REPLY_SUPPRESSED path=rule: bot already replied to this turn")
+            return
+        # CLAIM the turn SYNCHRONOUSLY (no await before this) so the judge / watchdog see it and
+        # don't also respond. The latch is the real guard (survives late STT fragments); the
+        # timestamp stamp is a backstop for the transcript-driven reply watchdog.
+        self._state.turn_replied = True
+        self._state.t_last_bot_text = time.monotonic()
+        self._state.bot_pending = False
+        self._state.bot_speaking = False
+        await super().trigger_user_turn_stopped()
+
+    async def process_frame(self, frame: Frame) -> ProcessFrameResult:
+        if isinstance(frame, TranscriptionFrame) and frame.text.strip():
+            self._accum = f"{self._accum} {frame.text}".strip()
+            self._delayed = False  # new content -> smart-turn gets a fresh single delay budget
+            token = ends_in_continuation(self._accum)
+            punct = ends_in_terminal_punct(self._accum)
+            if token:
+                self._cancel()  # WAIT — never fire on a continuation token
+                logger.info(f"TURN_RULE wait end='{token}' (continuation) — not firing")
+            elif punct:
+                self._arm(self._confirm_secs)  # terminal punct -> short confirm window
+            else:
+                self._arm(self._silence_secs)  # neutral ending -> silence backstop
         return ProcessFrameResult.CONTINUE
