@@ -249,12 +249,14 @@ async def run_bot(connection: SmallWebRTCConnection):
         ]
     )
     # Turn START (barge-in): immediate normal turns; interrupt the bot only on sustained
-    # voice (>=0.7s) OR >=3 non-backchannel words. enable_interruptions=False: the user's
-    # speech never cuts the bot off (full-duplex is step 4), so the turn machine can't get
-    # stuck after a mid-sentence interruption. Named ref so the TTS resync can clear its
-    # phantom 'bot speaking' flag.
+    # voice (>=0.7s) OR >=3 non-backchannel words (backchannels never cut in). STEP 4 FULL-
+    # DUPLEX: enable_interruptions=True lets the candidate cut the bot off mid-sentence. The
+    # strategy's trigger_user_turn_started override only actually broadcasts an interruption
+    # when the bot is SPEAKING, so normal turns and the thinking-gap don't fire spurious cuts.
+    # The step1-3.5 turn-state hardening (heartbeat reconciler, watchdog, full-resync, de-dup)
+    # is what makes flipping this on safe — it was the bug that kept the bot silent before.
     start_strat = HumanBargeInStartStrategy(
-        min_words=3, sustained_secs=0.7, enable_interruptions=False
+        min_words=3, sustained_secs=0.7, enable_interruptions=True
     )
     # Turn END (STEP 2): smart-turn-v3 ML analyzer OWNS the normal decision — it waits
     # through mid-sentence pauses (predicts INCOMPLETE) and ends the turn once you're

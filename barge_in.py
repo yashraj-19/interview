@@ -43,7 +43,10 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.turns.types import ProcessFrameResult
-from pipecat.turns.user_start.base_user_turn_start_strategy import BaseUserTurnStartStrategy
+from pipecat.turns.user_start.base_user_turn_start_strategy import (
+    BaseUserTurnStartStrategy,
+    UserTurnStartedParams,
+)
 from pipecat.turns.user_stop.base_user_turn_stop_strategy import BaseUserTurnStopStrategy
 
 _DEFAULT_BACKCHANNELS = "hmm,yeah,okay,ok,right,uh-huh,mhm,i see,got it"
@@ -109,6 +112,19 @@ class HumanBargeInStartStrategy(BaseUserTurnStartStrategy):
         self._triggered = True
         self._cancel_voice_task()
         await self.trigger_user_turn_started()
+
+    async def trigger_user_turn_started(self):
+        # STEP 4 full-duplex: broadcast an INTERRUPTION only when the bot is ACTUALLY speaking
+        # (a real barge-in). Normal turn starts and the thinking-gap (handled by the stitch)
+        # start the turn WITHOUT interrupting — so we never cancel a reply that isn't playing.
+        # When constructed with enable_interruptions=False (steps 1-3) this never interrupts.
+        await self._call_event_handler(
+            "on_user_turn_started",
+            UserTurnStartedParams(
+                enable_interruptions=self._enable_interruptions and self._bot_speaking,
+                enable_user_speaking_frames=self._enable_user_speaking_frames,
+            ),
+        )
 
     async def _sustained_voice(self):
         try:
