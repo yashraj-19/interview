@@ -41,6 +41,11 @@ INTERRUPT only if ALL THREE are true:
 2. That claim is CLEARLY and FACTUALLY WRONG or self-contradictory, and relevant to the question.
 3. You can name the exact wrong statement and the correct fact.
 
+A plain textbook error — a wrong complexity, a wrong definition, or a swapped concept (e.g. calling
+a stack FIFO, or a hash map O(log n)) — clears all three: INTERRUPT it confidently. Do not talk
+yourself out of an obvious mistake. (Note: speech-to-text garbles Big-O — "login"/"order of login"
+in a complexity context means "O(log n)"; read the intended Big-O, never a literal login system.)
+
 Otherwise CONTINUE. In particular, CONTINUE (do NOT interrupt) when the answer is:
 - vague, partial, incomplete, or still being formed;
 - hesitation, filler, or thinking out loud;
@@ -68,24 +73,25 @@ Q: "Walk me through two-sum."     A: "I'd do the take loop and then the uh map t
 
 # --- STEP 2: the REVEAL level, chosen in code by attempt # (one clear instruction) ---
 REVEAL = {
-    1: "This is the candidate's FIRST wrong attempt on this topic: ONLY gently flag that it does "
-    "not seem right and nudge them to reconsider, phrased as a question. Reveal NOTHING — do not "
-    "state the correct answer, the value, or the approach.",
-    2: "The candidate has now been wrong more than once: give a pointed HINT that pushes toward the "
-    "fix, but still do NOT state the correct answer or value outright.",
-    3: "The candidate keeps getting it wrong: it is now okay to briefly give the correct answer or "
-    "the key idea, then let them move on.",
+    1: "FIRST wrong attempt on this topic: be DIRECT and confident — plainly say the claim is wrong "
+    "and name the SPECIFIC thing that's wrong (e.g. 'a stack isn't FIFO'). But do NOT give the "
+    "correct answer or value — end with a sharp question that makes them find it themselves.",
+    2: "Still wrong: stay direct, and give a pointed HINT toward the fix — but still do NOT state the "
+    "correct answer or value outright.",
+    3: "Keeps getting it wrong: state the correct answer or key idea directly and briefly, then move on.",
 }
 
 # --- output / style (literal JSON, so no str.format here) ---
-JUDGE_OUTPUT = """If you interrupt, write a SHORT spoken interjection (1-2 sentences) like a sharp but fair human
-interviewer cutting in. Be specific about what is off. Never call a clearly wrong answer
-"partially correct." Never lecture. Vary phrasing. Conversational, no markdown, no lists.
+JUDGE_OUTPUT = """If you interrupt, write a SHORT, DIRECT spoken cut-in (1 sentence, max 2) — like a sharp senior
+interviewer who won't let a wrong claim slide. LEAD by plainly naming the error. Do NOT hedge:
+never use "I think", "there might be some confusion", "might be", "not quite", "it seems", "sort
+of", or "are you sure". Be firm and confident, never rude. Never call a clearly wrong answer
+"partially correct." No markdown, no lists — spoken words only.
 
 Respond with ONLY a JSON object and nothing else:
 {"interrupt": false, "line": ""}
 or
-{"interrupt": true, "line": "<your spoken interjection>"}"""
+{"interrupt": true, "line": "<direct cut-in that plainly names the specific wrong claim>"}"""
 
 _groq_client = None
 _anthropic_client = None
@@ -179,8 +185,11 @@ _REVEAL_RE = re.compile(
     r"|constant[\s-]*time|logarithmic|linear[\s-]*time|quadratic|amortized",
     re.IGNORECASE,
 )
-_NUDGE_LVL1 = "Are you sure about that? Walk me through your reasoning."
-_HINT_LVL2 = "That doesn't sound right to me. Think carefully, step by step, about how it actually works."
+# Direct, assertive fallbacks (used only when the model tried to state the actual ANSWER on
+# attempt 1/2). Lead by plainly saying it's wrong — no "are you sure" hedging — but still make
+# the candidate find the fix (Socratic). Generic because they fire after the specific line is stripped.
+_NUDGE_LVL1 = "That's not right. Think it through again — how does it actually work?"
+_HINT_LVL2 = "Still not right. Slow down and reason it out step by step — what's really happening there?"
 
 
 def reveals_answer(text: str) -> bool:
@@ -213,10 +222,19 @@ def confirms_or_denies(text: str) -> bool:
     return bool(_CONFIRM_DENY_RE.search(text or ""))
 
 
-def _block_reveal(line: str, level: int) -> tuple[str, bool]:
-    """On attempt level 1 or 2, if the line gives away an answer term/value, swap it for a
-    content-free nudge (1) / hint (2). Returns (new_line, blocked). Level 3+ may reveal."""
-    if level >= 3 or not reveals_answer(line):
+def _block_reveal(line: str, level: int, answer: str = "") -> tuple[str, bool]:
+    """On attempt level 1 or 2, block ONLY answer terms the candidate did NOT already say (i.e. the
+    actual ANSWER). Naming/negating the candidate's OWN wrong term ('a stack isn't FIFO') gives
+    nothing away and lets the cut-in stay direct/assertive, so it's allowed. If a NEW answer term
+    is present, swap the line for a direct nudge (1) / hint (2). Level 3+ may reveal anything.
+    Returns (new_line, blocked)."""
+    if level >= 3:
+        return line, False
+    line_terms = {m.group(0).lower() for m in _REVEAL_RE.finditer(line)}
+    if not line_terms:
+        return line, False
+    said = {m.group(0).lower() for m in _REVEAL_RE.finditer(answer or "")}
+    if not (line_terms - said):  # only repeats the candidate's own term(s) -> reveals nothing new
         return line, False
     return (_NUDGE_LVL1 if level == 1 else _HINT_LVL2), True
 
@@ -252,7 +270,7 @@ async def judge_answer(question: str, answer: str, attempt: int = 1) -> dict:
         verdict["defer"] = True
     # REVEAL_BLOCKED (Fix #2): never let attempt 1/2 give away the answer, even if the model tried.
     if verdict["interrupt"]:
-        new_line, blocked = _block_reveal(verdict["line"], level)
+        new_line, blocked = _block_reveal(verdict["line"], level, answer)
         if blocked:
             logger.warning(
                 f"REVEAL_BLOCKED (attempt {level}): model tried to reveal — swapped to nudge/hint. "
