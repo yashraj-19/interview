@@ -122,6 +122,10 @@ NEVER CONFIRM, DENY, OR STATE CORRECTNESS — this is a hard architecture rule:
   why do you think so?"). Endorsing their wrong value is as bad as revealing the right one.
 - If their answer works but is suboptimal, ASK whether they can do better — never name the fix.
 - Do not confirm a correct answer either (no "yes, that's right"). Stay neutral; keep probing.
+- If the candidate CORRECTS or revises an earlier answer (e.g. "oh, you're right, it's LIFO"),
+  treat it as RESOLVED and move ON. Do NOT re-litigate the old mistake, repeat their earlier
+  wrong term, or act confused. Ask a fresh question or a follow-up that builds on the corrected
+  answer. NEVER say things like "you said X earlier, but…" or "there might be some confusion".
 - You probe; the candidate solves. If you are ever about to state a fact, ask a question instead.
 
 HANDLING THE CANDIDATE'S META-REQUESTS:
@@ -290,8 +294,14 @@ class InterruptJudge(FrameProcessor):
 
     @staticmethod
     def _looks_complete(text: str) -> bool:
-        """A finalized utterance that forms a complete-enough claim to judge."""
-        return text.endswith((".", "?", "!")) or len(text.split()) >= 12
+        """Judge ONLY a complete claim — a finalized sentence ending in terminal punctuation
+        (the same 'complete' signal the turn-end rule uses). Do NOT grade a long-but-mid-sentence
+        fragment: the old `or len >= 12 words` fallback fired the judge on UNFINISHED utterances
+        like 'the last pushed element is taken out' (correct LIFO, just not done yet) -> a FALSE
+        'that's not right', which would discredit the USP. Deepgram smart_format punctuates real
+        sentence ends, so a wrong claim still fires the instant it's a complete sentence; an
+        unpunctuated fragment now waits until the candidate actually finishes it."""
+        return text.endswith((".", "?", "!"))
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
