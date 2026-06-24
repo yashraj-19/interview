@@ -114,7 +114,12 @@ async def _call_groq(system: str, user: str) -> str:
             # Same GROQ_API_KEY the conversation GroqLLMService uses. Explicit 10s timeout; SDK
             # internal retries OFF (max_retries=0) so worst case stays bounded — the loop does
             # exactly ONE fresh-client retry, then gives up to CONTINUE (no long mid-interview hang).
-            _groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"), timeout=10.0, max_retries=0)
+            # .strip() is the actual fix: the Render env var has a trailing newline, which made
+            # "Bearer <key>\n" an illegal HTTP header -> LocalProtocolError -> "Connection error"
+            # on every judge call. voice_agent strips its key (so conversation worked); judge didn't.
+            _groq_client = AsyncGroq(
+                api_key=os.getenv("GROQ_API_KEY", "").strip(), timeout=10.0, max_retries=0
+            )
         try:
             resp = await _groq_client.chat.completions.create(
                 model=JUDGE_MODEL,
