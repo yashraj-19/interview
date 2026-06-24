@@ -23,6 +23,7 @@ import re
 import sys
 import time
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -56,7 +57,7 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
 from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.transports.base_transport import TransportParams
-from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
+from pipecat.transports.smallwebrtc.connection import IceServer, SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.audio.turn.base_turn_analyzer import EndOfTurnState
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
@@ -90,6 +91,57 @@ logger.remove()
 logger.add(sys.stderr, level="INFO")
 
 STUN = ["stun:stun.l.google.com:19302"]
+
+# DSA vocabulary boosted via Deepgram nova-3 keyterm prompting so these terms transcribe correctly
+# at the SOURCE (e.g. "FIFO" instead of "FIFA"/"five-four") -> the judge fires on the REAL term, no
+# fuzzy matching and no false-positive risk. The lower-risk half of the garble fix.
+DSA_KEYTERMS = [
+    "FIFO", "LIFO", "stack", "queue", "array", "linked list", "hash map", "hash table",
+    "binary search", "binary tree", "Big O", "time complexity", "log n", "O of n",
+    "recursion", "algorithm", "data structure", "pointer", "node",
+]
+
+# --- ICE / TURN (deploy infra; interview logic unchanged) -------------------
+# Local dev: STUN only (browser<->localhost needs no relay). On Render the
+# browser and server cannot reach each other directly, so a TURN RELAY is
+# required for audio. We use Metered's DYNAMIC credentials — METERED_DOMAIN +
+# METERED_API_KEY (NOT static URLs) — fetched per connection, exposed to the
+# browser via /api/ice and given to the server-side aiortc connection.
+# TURN is a FALLBACK: default ICE still tries host/srflx first (we do NOT set
+# iceTransportPolicy='relay').
+METERED_DOMAIN = os.getenv("METERED_DOMAIN", "").strip()
+METERED_API_KEY = os.getenv("METERED_API_KEY", "").strip()
+
+
+async def _fetch_ice_config() -> list[dict]:
+    """ICE servers as plain dicts [{urls, username?, credential?}]: STUN always,
+    Metered TURN (fresh dynamic creds) appended when configured. Never raises —
+    on failure we fall back to STUN-only (audio may then fail to connect on Render,
+    which the logs will show)."""
+    servers: list[dict] = [{"urls": u} for u in STUN]
+    if METERED_DOMAIN and METERED_API_KEY:
+        url = f"https://{METERED_DOMAIN}/api/v1/turn/credentials?apiKey={METERED_API_KEY}"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                fetched = resp.json()
+            if isinstance(fetched, list):
+                servers.extend(s for s in fetched if isinstance(s, dict) and s.get("urls"))
+        except Exception as e:
+            logger.warning(
+                f"Metered TURN fetch failed ({e}) — STUN only; audio may not connect on Render"
+            )
+    return servers
+
+
+def _to_ice_servers(dicts: list[dict]) -> list[IceServer]:
+    """Plain ICE dicts -> aiortc IceServer objects for the server-side connection."""
+    return [
+        IceServer(urls=d["urls"], username=d.get("username"), credential=d.get("credential"))
+        for d in dicts
+    ]
+
 
 app = FastAPI()
 _connections: dict[str, SmallWebRTCConnection] = {}
@@ -202,11 +254,17 @@ class RevealGuard(FrameProcessor):
     only ~as long as the TTS aggregates a sentence anyway, so ~no added latency. Placed right
     after the LLM so a blocked reveal is never logged or shown either."""
 
-    # NEUTRAL on purpose: it neither confirms nor denies, so it's safe whether the candidate
-    # was right or wrong. The old "that's worth reconsidering" implied WRONG — itself a
-    # correctness signal the interviewer isn't allowed to give (and flat-out misleading when the
-    # candidate was actually right, e.g. confirming an O(1) answer).
-    _PROBE = "Walk me through your reasoning step by step — I want to follow exactly how you got there."
+    # NEUTRAL on purpose: the guard fires for BOTH right and wrong answers (it can't tell them
+    # apart), so the fallback must NOT assert wrongness — that would tell a CORRECT candidate
+    # they're wrong. Assertive, error-NAMING correction is the JUDGE's lane (it knows the answer
+    # is wrong). VARIED so repeated guard hits don't read as a robotic verbatim loop.
+    _PROBES = (
+        "Walk me through your reasoning step by step.",
+        "Take me through exactly how that works.",
+        "Slow down and reason that out — what happens at each step?",
+        "Talk me through the mechanism there, piece by piece.",
+        "How did you get there? Walk me through it.",
+    )
     _MAX_CLAUSE_CHARS = 90  # decide by here even without a sentence end
 
     def __init__(self, state, **kwargs):
@@ -217,6 +275,7 @@ class RevealGuard(FrameProcessor):
         self._decided = False
         self._blocked = False
         self._drop = False  # drop the whole in-flight response (judge already handled this turn)
+        self._probe_i = 0   # rotate the neutral fallback so it never repeats verbatim
 
     def _reset(self):
         self._buf = ""
@@ -241,7 +300,9 @@ class RevealGuard(FrameProcessor):
             for f in self._held:
                 if isinstance(f, LLMFullResponseStartFrame):
                     await self.push_frame(f, direction)
-            await self.push_frame(LLMTextFrame(text=self._PROBE), direction)
+            probe = self._PROBES[self._probe_i % len(self._PROBES)]
+            self._probe_i += 1
+            await self.push_frame(LLMTextFrame(text=probe), direction)
         else:
             for f in self._held:
                 await self.push_frame(f, direction)
@@ -312,6 +373,9 @@ async def run_bot(connection: SmallWebRTCConnection):
             interim_results=True,
             smart_format=True,
             vad_events=True,
+            # keyterm prompting (nova-3): boost DSA vocab so FIFO/LIFO/Big-O transcribe correctly
+            # at the source -> the judge fires on the real term, not a garble (no fuzzy matching).
+            keyterm=DSA_KEYTERMS,
             # endpointing=250 (spec §3): finals arrive fast WITHOUT over-fragmenting.
             # endpointing=100 split utterances into "use" / "order of" / "log n." finals
             # (observed live). Smart-turn and the watchdog act on ACCUMULATED text across
@@ -541,7 +605,7 @@ async def offer(request: dict):
         conn = _connections[pc_id]
         await conn.renegotiate(sdp=request["sdp"], type=request["type"])
     else:
-        conn = SmallWebRTCConnection(STUN)
+        conn = SmallWebRTCConnection(_to_ice_servers(await _fetch_ice_config()))
         await conn.initialize(sdp=request["sdp"], type=request["type"])
 
         @conn.event_handler("closed")
@@ -553,6 +617,12 @@ async def offer(request: dict):
     answer = conn.get_answer()
     _connections[answer["pc_id"]] = conn
     return JSONResponse(answer)
+
+
+@app.get("/api/ice")
+async def ice():
+    """ICE servers for the browser: STUN + Metered TURN fallback (creds from env)."""
+    return JSONResponse({"iceServers": await _fetch_ice_config()})
 
 
 @app.websocket("/ws")
@@ -573,5 +643,11 @@ app.mount("/", StaticFiles(directory="client", html=True), name="client")
 
 
 if __name__ == "__main__":
-    logger.info("SViam WebRTC server on http://localhost:8000  (open in Chrome)")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", "8000"))  # Render injects $PORT; 8000 for local dev
+    # This app is STATEFUL PER PROCESS (in-memory WebRTC _connections, _ui_clients,
+    # one pipeline per connection) -> it MUST run single-process. Render sets
+    # WEB_CONCURRENCY=2, which makes uvicorn spawn 2 workers (and, with an app object,
+    # crash demanding an import string). Force exactly one in-process worker.
+    os.environ.pop("WEB_CONCURRENCY", None)
+    logger.info(f"SViam WebRTC server on http://0.0.0.0:{port}")
+    uvicorn.run(app, host="0.0.0.0", port=port, workers=1, reload=False)

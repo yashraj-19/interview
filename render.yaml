@@ -1,0 +1,33 @@
+# Render Blueprint for the SViam voice interviewer.
+# Deploys the `deploy-render` branch (the frozen baseline on main has no infra).
+services:
+  - type: web
+    name: sviam-interviewer
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    branch: deploy-render
+    region: oregon            # US West — nearest the California demo user
+    # >>> INSTANCE SIZE — edit THIS ONE LINE to scale <<<
+    # pro = 2 CPU / 4 GB (prevents ONNX + real-time-audio jitter; the size you want for the demo).
+    # standard = 1 CPU / 2 GB (cheaper, may jitter under load). pro_plus = 4 CPU / 8 GB (more headroom).
+    plan: pro
+    healthCheckPath: /
+    autoDeploy: false          # deploy manually for a controlled demo; flip to true for auto-deploy on push
+    envVars:
+      # --- Secrets: set values in the Render dashboard (sync:false => not in git) ---
+      - key: GROQ_API_KEY
+        sync: false
+      - key: DEEPGRAM_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: METERED_DOMAIN        # e.g. your-app.metered.live  (TURN, dynamic creds)
+        sync: false
+      - key: METERED_API_KEY       # Metered API key (TURN, dynamic creds)
+        sync: false
+      # --- Non-secret config: pinned here so the demo baseline (scout) is reproducible ---
+      - key: JUDGE_PROVIDER
+        value: groq
+      - key: JUDGE_MODEL
+        value: meta-llama/llama-4-scout-17b-16e-instruct
+      # PORT is injected by Render automatically — do NOT set it here.
