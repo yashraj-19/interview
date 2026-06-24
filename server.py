@@ -343,7 +343,19 @@ class RevealGuard(FrameProcessor):
                     await self._decide(direction)
                 return
             if self._blocked:
-                return  # drop the rest of the original (revealing) reply; probe already sent
+                return  # already truncated/swapped — drop the rest
+            # Rolling scan of the WHOLE reply, not just the opener: if a LATER clause leaks an
+            # answer term or states correctness (e.g. re-raising "FIFO" after the candidate
+            # corrected themselves), stop streaming the tail. The clean part already played, so
+            # we can't un-say it — but the leak never reaches TTS. No added latency.
+            self._buf += frame.text or ""
+            if reveals_answer(self._buf) or confirms_or_denies(self._buf):
+                self._blocked = True
+                logger.warning(
+                    f"REVEAL_BLOCKED (interviewer): later clause leaked — truncating reply. "
+                    f"was: {self._buf!r}"
+                )
+                return
             await self.push_frame(frame, direction)
             return
         if isinstance(frame, LLMFullResponseEndFrame) and not self._decided:
