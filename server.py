@@ -623,5 +623,10 @@ app.mount("/", StaticFiles(directory="client", html=True), name="client")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))  # Render injects $PORT; 8000 for local dev
+    # This app is STATEFUL PER PROCESS (in-memory WebRTC _connections, _ui_clients,
+    # one pipeline per connection) -> it MUST run single-process. Render sets
+    # WEB_CONCURRENCY=2, which makes uvicorn spawn 2 workers (and, with an app object,
+    # crash demanding an import string). Force exactly one in-process worker.
+    os.environ.pop("WEB_CONCURRENCY", None)
     logger.info(f"SViam WebRTC server on http://0.0.0.0:{port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port, workers=1, reload=False)
