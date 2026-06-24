@@ -1,0 +1,15 @@
+# Keep the image small and secret-free.
+venv/
+.env
+.env.*
+.git/
+.gitignore
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.output
+*.log
+.claude/
+*.md
+!README_RUN.md

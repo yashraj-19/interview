@@ -5,6 +5,20 @@
 
 const STUN = [{ urls: "stun:stun.l.google.com:19302" }];
 
+// Pull ICE servers (STUN + TURN relay) from the server, which reads TURN creds
+// from env. Falls back to STUN-only so LOCAL dev (browser<->localhost) is unchanged.
+// No iceTransportPolicy='relay' — default ICE tries direct first, TURN is fallback.
+async function getIceServers() {
+  try {
+    const r = await fetch("/api/ice");
+    if (r.ok) {
+      const j = await r.json();
+      if (j && Array.isArray(j.iceServers) && j.iceServers.length) return j.iceServers;
+    }
+  } catch (e) { /* fall through to STUN */ }
+  return STUN;
+}
+
 const connectBtn = document.getElementById("connectBtn");
 const endBtn = document.getElementById("endBtn");
 const remoteAudio = document.getElementById("remoteAudio");
@@ -102,7 +116,8 @@ async function connect() {
     return;
   }
 
-  pc = new RTCPeerConnection({ iceServers: STUN });
+  const iceServers = await getIceServers();
+  pc = new RTCPeerConnection({ iceServers });
   pc.ontrack = (e) => { remoteAudio.srcObject = e.streams[0]; };
   pc.onconnectionstatechange = () => {
     if (["failed", "disconnected", "closed"].includes(pc.connectionState) && started) end();

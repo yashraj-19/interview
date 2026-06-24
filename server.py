@@ -23,6 +23,7 @@ import re
 import sys
 import time
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -56,7 +57,7 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
 from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.transports.base_transport import TransportParams
-from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
+from pipecat.transports.smallwebrtc.connection import IceServer, SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.audio.turn.base_turn_analyzer import EndOfTurnState
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
@@ -90,6 +91,48 @@ logger.remove()
 logger.add(sys.stderr, level="INFO")
 
 STUN = ["stun:stun.l.google.com:19302"]
+
+# --- ICE / TURN (deploy infra; interview logic unchanged) -------------------
+# Local dev: STUN only (browser<->localhost needs no relay). On Render the
+# browser and server cannot reach each other directly, so a TURN RELAY is
+# required for audio. We use Metered's DYNAMIC credentials — METERED_DOMAIN +
+# METERED_API_KEY (NOT static URLs) — fetched per connection, exposed to the
+# browser via /api/ice and given to the server-side aiortc connection.
+# TURN is a FALLBACK: default ICE still tries host/srflx first (we do NOT set
+# iceTransportPolicy='relay').
+METERED_DOMAIN = os.getenv("METERED_DOMAIN", "").strip()
+METERED_API_KEY = os.getenv("METERED_API_KEY", "").strip()
+
+
+async def _fetch_ice_config() -> list[dict]:
+    """ICE servers as plain dicts [{urls, username?, credential?}]: STUN always,
+    Metered TURN (fresh dynamic creds) appended when configured. Never raises —
+    on failure we fall back to STUN-only (audio may then fail to connect on Render,
+    which the logs will show)."""
+    servers: list[dict] = [{"urls": u} for u in STUN]
+    if METERED_DOMAIN and METERED_API_KEY:
+        url = f"https://{METERED_DOMAIN}/api/v1/turn/credentials?apiKey={METERED_API_KEY}"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                fetched = resp.json()
+            if isinstance(fetched, list):
+                servers.extend(s for s in fetched if isinstance(s, dict) and s.get("urls"))
+        except Exception as e:
+            logger.warning(
+                f"Metered TURN fetch failed ({e}) — STUN only; audio may not connect on Render"
+            )
+    return servers
+
+
+def _to_ice_servers(dicts: list[dict]) -> list[IceServer]:
+    """Plain ICE dicts -> aiortc IceServer objects for the server-side connection."""
+    return [
+        IceServer(urls=d["urls"], username=d.get("username"), credential=d.get("credential"))
+        for d in dicts
+    ]
+
 
 app = FastAPI()
 _connections: dict[str, SmallWebRTCConnection] = {}
@@ -541,7 +584,7 @@ async def offer(request: dict):
         conn = _connections[pc_id]
         await conn.renegotiate(sdp=request["sdp"], type=request["type"])
     else:
-        conn = SmallWebRTCConnection(STUN)
+        conn = SmallWebRTCConnection(_to_ice_servers(await _fetch_ice_config()))
         await conn.initialize(sdp=request["sdp"], type=request["type"])
 
         @conn.event_handler("closed")
@@ -553,6 +596,12 @@ async def offer(request: dict):
     answer = conn.get_answer()
     _connections[answer["pc_id"]] = conn
     return JSONResponse(answer)
+
+
+@app.get("/api/ice")
+async def ice():
+    """ICE servers for the browser: STUN + Metered TURN fallback (creds from env)."""
+    return JSONResponse({"iceServers": await _fetch_ice_config()})
 
 
 @app.websocket("/ws")
@@ -573,5 +622,6 @@ app.mount("/", StaticFiles(directory="client", html=True), name="client")
 
 
 if __name__ == "__main__":
-    logger.info("SViam WebRTC server on http://localhost:8000  (open in Chrome)")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", "8000"))  # Render injects $PORT; 8000 for local dev
+    logger.info(f"SViam WebRTC server on http://0.0.0.0:{port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
