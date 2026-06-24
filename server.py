@@ -92,6 +92,15 @@ logger.add(sys.stderr, level="INFO")
 
 STUN = ["stun:stun.l.google.com:19302"]
 
+# DSA vocabulary boosted via Deepgram nova-3 keyterm prompting so these terms transcribe correctly
+# at the SOURCE (e.g. "FIFO" instead of "FIFA"/"five-four") -> the judge fires on the REAL term, no
+# fuzzy matching and no false-positive risk. The lower-risk half of the garble fix.
+DSA_KEYTERMS = [
+    "FIFO", "LIFO", "stack", "queue", "array", "linked list", "hash map", "hash table",
+    "binary search", "binary tree", "Big O", "time complexity", "log n", "O of n",
+    "recursion", "algorithm", "data structure", "pointer", "node",
+]
+
 # --- ICE / TURN (deploy infra; interview logic unchanged) -------------------
 # Local dev: STUN only (browser<->localhost needs no relay). On Render the
 # browser and server cannot reach each other directly, so a TURN RELAY is
@@ -245,11 +254,17 @@ class RevealGuard(FrameProcessor):
     only ~as long as the TTS aggregates a sentence anyway, so ~no added latency. Placed right
     after the LLM so a blocked reveal is never logged or shown either."""
 
-    # NEUTRAL on purpose: it neither confirms nor denies, so it's safe whether the candidate
-    # was right or wrong. The old "that's worth reconsidering" implied WRONG — itself a
-    # correctness signal the interviewer isn't allowed to give (and flat-out misleading when the
-    # candidate was actually right, e.g. confirming an O(1) answer).
-    _PROBE = "Walk me through your reasoning step by step — I want to follow exactly how you got there."
+    # NEUTRAL on purpose: the guard fires for BOTH right and wrong answers (it can't tell them
+    # apart), so the fallback must NOT assert wrongness — that would tell a CORRECT candidate
+    # they're wrong. Assertive, error-NAMING correction is the JUDGE's lane (it knows the answer
+    # is wrong). VARIED so repeated guard hits don't read as a robotic verbatim loop.
+    _PROBES = (
+        "Walk me through your reasoning step by step.",
+        "Take me through exactly how that works.",
+        "Slow down and reason that out — what happens at each step?",
+        "Talk me through the mechanism there, piece by piece.",
+        "How did you get there? Walk me through it.",
+    )
     _MAX_CLAUSE_CHARS = 90  # decide by here even without a sentence end
 
     def __init__(self, state, **kwargs):
@@ -260,6 +275,7 @@ class RevealGuard(FrameProcessor):
         self._decided = False
         self._blocked = False
         self._drop = False  # drop the whole in-flight response (judge already handled this turn)
+        self._probe_i = 0   # rotate the neutral fallback so it never repeats verbatim
 
     def _reset(self):
         self._buf = ""
@@ -284,7 +300,9 @@ class RevealGuard(FrameProcessor):
             for f in self._held:
                 if isinstance(f, LLMFullResponseStartFrame):
                     await self.push_frame(f, direction)
-            await self.push_frame(LLMTextFrame(text=self._PROBE), direction)
+            probe = self._PROBES[self._probe_i % len(self._PROBES)]
+            self._probe_i += 1
+            await self.push_frame(LLMTextFrame(text=probe), direction)
         else:
             for f in self._held:
                 await self.push_frame(f, direction)
@@ -355,6 +373,9 @@ async def run_bot(connection: SmallWebRTCConnection):
             interim_results=True,
             smart_format=True,
             vad_events=True,
+            # keyterm prompting (nova-3): boost DSA vocab so FIFO/LIFO/Big-O transcribe correctly
+            # at the source -> the judge fires on the real term, not a garble (no fuzzy matching).
+            keyterm=DSA_KEYTERMS,
             # endpointing=250 (spec §3): finals arrive fast WITHOUT over-fragmenting.
             # endpointing=100 split utterances into "use" / "order of" / "log n." finals
             # (observed live). Smart-turn and the watchdog act on ACCUMULATED text across
