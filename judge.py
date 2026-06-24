@@ -102,18 +102,40 @@ _anthropic_client = None
 
 
 async def _call_groq(system: str, user: str) -> str:
+    # The cached client is reused for the container's whole life. On an always-on host a
+    # pooled keep-alive connection can go idle and get closed server-side -> the next call
+    # raises APIConnectionError ("Connection error"), which silently sank every judge verdict
+    # on Render. On failure, drop the client and retry once with a FRESH connection.
     global _groq_client
-    if _groq_client is None:
-        from groq import AsyncGroq
+    from groq import AsyncGroq
 
-        _groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
-    resp = await _groq_client.chat.completions.create(
-        model=JUDGE_MODEL,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        temperature=0.2,
-        max_tokens=120,
-    )
-    return resp.choices[0].message.content or ""
+    for attempt in (1, 2):
+        if _groq_client is None:
+            # Same GROQ_API_KEY the conversation GroqLLMService uses. Explicit 10s timeout; SDK
+            # internal retries OFF (max_retries=0) so worst case stays bounded — the loop does
+            # exactly ONE fresh-client retry, then gives up to CONTINUE (no long mid-interview hang).
+            _groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"), timeout=10.0, max_retries=0)
+        try:
+            resp = await _groq_client.chat.completions.create(
+                model=JUDGE_MODEL,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                temperature=0.2,
+                max_tokens=120,
+            )
+            return resp.choices[0].message.content or ""
+        except Exception as e:
+            logger.warning(
+                f"judge Groq attempt {attempt} failed ({type(e).__name__}: {e!r}); "
+                + ("rebuilding client + retrying" if attempt == 1 else "giving up")
+            )
+            try:
+                await _groq_client.close()
+            except Exception:
+                pass
+            _groq_client = None
+            if attempt == 2:
+                raise
+    return ""  # unreachable
 
 
 async def _call_anthropic(system: str, user: str) -> str:
@@ -255,13 +277,22 @@ async def judge_answer(question: str, answer: str, attempt: int = 1) -> dict:
         f"Interviewer's last question:\n{question}\n\n"
         f"Candidate's finalized answer so far:\n{answer}"
     )
+    logger.info(
+        f"JUDGE invoke ({JUDGE_PROVIDER}/{JUDGE_MODEL}) attempt={attempt} "
+        f"| q={question[:60]!r} | a={answer[:110]!r}"
+    )
     try:
         if JUDGE_PROVIDER == "anthropic":
             raw = await _call_anthropic(system, user)
         else:
             raw = await _call_groq(system, user)
     except Exception as e:
-        logger.error(f"judge LLM call failed: {e}")
+        # Loud + final: shows in Render logs AFTER the fresh-client retry in _call_groq is
+        # exhausted, so we see the true outcome (type + cause), not just "Connection error".
+        logger.error(
+            f"judge LLM call FAILED after retry: {type(e).__name__}: {e!r} "
+            f"| cause={getattr(e, '__cause__', None)!r} -> defaulting to CONTINUE"
+        )
         return {"interrupt": False, "line": "", "defer": False}
     verdict = _parse(raw)
     # Discipline downgrade: a clarification/follow-up interjection (no incorrect fact named)
